@@ -848,12 +848,15 @@ async def finalize_login(user_id: int, client: TelegramClient, phone: str, state
     await set_ad_bio(client, is_pro=pro)
 
     await state.clear()
-    await bot.send_message(
-        user_id,
-        f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
-        f"{'🟢 PRO tarif faol - reklama yo‘q' if pro else '🔴 Oddiy tarif - reklama bio ga qo‘yildi'}"
-        reply_markup=get_main_keyboard()
-    )
+
+tarif_text = "🟢 PRO tarif faol - reklama yo‘q" if pro else "🔴 Oddiy tarif - reklama bio ga qo‘yildi"
+
+await bot.send_message(
+    user_id,
+    f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
+    f"{tarif_text}",
+    reply_markup=get_main_keyboard()
+)
 
 # ─────────────────────────────────────────────
 # LOGOUT
