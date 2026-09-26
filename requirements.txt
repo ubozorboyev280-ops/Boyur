@@ -1,0 +1,7 @@
+aiogram--3.31.0
+
+aiosqlite 0.22.1
+
+python-dotenv- 1.2.3
+
+telethon--1.45
