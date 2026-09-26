@@ -851,7 +851,7 @@ async def finalize_login(user_id: int, client: TelegramClient, phone: str, state
     await bot.send_message(
         user_id,
         f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
-        f"{'🟢 PRO tarif faol — reklama yo\'q' if pro else '🔴 Oddiy tarif — reklama bio ga qo\'yildi'}",
+        f"{'🟢 PRO tarif faol - reklama yo‘q' if pro else '🔴 Oddiy tarif - reklama bio ga qo‘yildi'}"
         reply_markup=get_main_keyboard()
     )
 
