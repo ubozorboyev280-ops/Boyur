@@ -16,19 +16,30 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup,
     Message, CallbackQuery, ReplyKeyboardRemove,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton as TelegramKeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, PeerFloodError
-from telethon.utils import get_display_name
-from telethon.tl.types import UserStatusOnline
+from telethon.errors import (
+    FloodWaitError, UserPrivacyRestrictedError, PeerFloodError,
+    PremiumAccountRequiredError, EntityBoundsInvalidError,
+    SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+)
+from telethon.tl.types import (
+    UserStatusOnline, Chat, DocumentAttributeCustomEmoji, InputStickerSetShortName,
+    MessageEntityCustomEmoji,
+)
+from telethon.utils import get_display_name, get_peer_id
+from telethon.tl.functions.messages import GetStickerSetRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest
+from urllib.parse import urlparse
+from telethon.utils import get_display_name, get_peer_id
 
 load_dotenv()
 
@@ -42,17 +53,31 @@ def required_env(name: str) -> str:
     return value
 
 
-API_ID    = int(os.getenv("API_ID", "31355300"))
-API_HASH  = os.getenv("API_HASH", "5fb76826631c5238f84dede2f593b234")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8646327120:AAHpmdOUEkoj4CvioeTiETWhAanhwZ7WgQc")
-ADMIN_ID  = int(os.getenv("ADMIN_ID", "8764954646"))
+API_ID    = int(required_env("API_ID"))
+if not 1 <= API_ID <= 2_147_483_647:
+    raise RuntimeError("API_ID must be the valid app ID from my.telegram.org, not a Telegram user ID")
+API_HASH  = required_env("API_HASH")
+BOT_TOKEN = required_env("BOT_TOKEN")
+ADMIN_ID  = int(required_env("ADMIN_ID"))
+if ADMIN_ID <= 0:
+    raise RuntimeError("ADMIN_ID must be a positive Telegram user ID")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@owapro")
 DB_FILE   = "database22.db"
+CUSTOM_EMOJI_PACK = os.getenv("CUSTOM_EMOJI_PACK", "").strip()
 
-AD_TEXT = "🤖 Powered by @pro_utaggerbot 🚀 Bepul Utag xizmati | Bir bosishda tag 🤖."
-BIO_AD_TEXT = "🤖 Powered by @pro_utaggerbot 🚀"
-AUTO_REPLY_AD = f"{AD_TEXT}\n🤖 @pro_utaggerbot orqali avto javob qilindi."
+AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
+BIO_AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
+AUTO_REPLY_AD = f"{AD_TEXT}\n🤖 Avto javob qilindi."
 SOURCE_FILE = os.getenv("SOURCE_FILE", __file__)
+
+
+def get_utag_command_help() -> str:
+    return (
+        "📌 <b>uTag buyruqlari</b> (guruhda yozing):\n"
+        "• <code>.s</code> — uTag boshlash\n"
+        "• <code>.r</code> — random uTag\n"
+        "• <code>.f</code> — uTag to'xtatish"
+    )
 
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -60,9 +85,35 @@ dp  = Dispatcher(storage=storage)
 
 userbot_clients: dict[str, TelegramClient] = {}
 _utag_tasks: dict[str, asyncio.Task] = {}
+_utag_suppress_ad_tasks: set[asyncio.Task] = set()
+_raid_locks: dict[str, asyncio.Lock] = {}
 _auto_reply_cooldowns: dict[tuple[str, int], datetime] = {}
 _scrape_group_choices: dict[str, dict[str, object]] = {}
+_custom_emoji_pack_cache: list[tuple[int, str]] = []
+_custom_emoji_pack_lock = asyncio.Lock()
+_button_custom_emoji_ids: dict[str, str] = {}
+_button_catalog: dict[str, str] = {}
+_button_emoji_target_keys: list[str] = []
 bot_username = ""
+
+
+def _build_emoji_button(button_type, text: str, kwargs: dict):
+    key = str(kwargs.get("callback_data") or kwargs.get("url") or text)
+    if key and not key.startswith(("button_emoji_", "admin_custom_emoji", "admin_button_emoji")):
+        _button_catalog[key] = text
+        icon_id = _button_custom_emoji_ids.get(key)
+        if icon_id and not kwargs.get("icon_custom_emoji_id"):
+            kwargs["icon_custom_emoji_id"] = icon_id
+    return button_type(text=text, **kwargs)
+
+
+def InlineKeyboardButton(*, text: str, **kwargs):
+    return _build_emoji_button(TelegramInlineKeyboardButton, text, kwargs)
+
+
+def KeyboardButton(*, text: str, **kwargs):
+    return _build_emoji_button(TelegramKeyboardButton, text, kwargs)
+
 
 # ─────────────────────────────────────────────
 # STATES
@@ -78,9 +129,12 @@ class UserStatesGroup(StatesGroup):
     auto_msg_usernames = State()
     auto_reply_text    = State()
     scrape_group_select = State()
+    scrape_mode        = State()
     scrape_count       = State()
     admin_broadcast        = State()
     admin_add_channel      = State()
+    admin_raid_add_group   = State()
+    admin_custom_emoji_pack = State()
     admin_give_pro         = State()
     contest_channel        = State()
     contest_max_users      = State()
@@ -91,6 +145,7 @@ class UserStatesGroup(StatesGroup):
 # DB
 # ─────────────────────────────────────────────
 async def init_db():
+    global CUSTOM_EMOJI_PACK
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -130,8 +185,24 @@ async def init_db():
         await db.execute("""
         CREATE TABLE IF NOT EXISTS utag_settings (
             owner_id TEXT PRIMARY KEY,
-            delay    REAL NOT NULL DEFAULT 1.5,
+            delay    REAL NOT NULL DEFAULT 0.5,
             updated_at TEXT
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS raid_groups (
+            chat_id   TEXT PRIMARY KEY,
+            title     TEXT NOT NULL,
+            added_at  TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS raid_usage (
+            user_id   TEXT PRIMARY KEY,
+            used_at   TEXT NOT NULL
         )""")
         try:
             await db.execute(
@@ -169,19 +240,19 @@ async def init_db():
             joined_at  TEXT,
             PRIMARY KEY (contest_id, user_id)
         )""")
-        # Default kanallar (agar bo'sh bo'lsa)
-        async with db.execute("SELECT COUNT(*) FROM sub_channels") as c:
-            count = (await c.fetchone())[0]
-        if count == 0:
-            await db.execute(
-                "INSERT OR IGNORE INTO sub_channels VALUES (?,?,?)",
-                ("@vip_mafia_uz", "https://t.me/vip_mafia_uz", datetime.now(timezone.utc).isoformat())
-            )
-            await db.execute(
-                "INSERT OR IGNORE INTO sub_channels VALUES (?,?,?)",
-                ("@pro_utager_news", "https://t.me/pro_utager_news", datetime.now(timezone.utc).isoformat())
-            )
         await db.commit()
+        rows = await db.execute_fetchall(
+            "SELECT value FROM bot_settings WHERE key = 'custom_emoji_pack'"
+        )
+        if rows:
+            CUSTOM_EMOJI_PACK = rows[0][0]
+        rows = await db.execute_fetchall(
+            "SELECT key, value FROM bot_settings WHERE key LIKE 'button_emoji:%'"
+        )
+        _button_custom_emoji_ids.clear()
+        _button_custom_emoji_ids.update({
+            key.removeprefix("button_emoji:"): value for key, value in rows
+        })
 
 # ─────────────────────────────────────────────
 # CHANNEL HELPERS
@@ -192,16 +263,51 @@ async def get_channels() -> list[dict]:
             rows = await cur.fetchall()
     return [{"username": r[0], "url": r[1]} for r in rows]
 
-async def check_subscriptions(user_id: int) -> bool:
+
+async def get_raid_groups() -> list[dict]:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT chat_id, title FROM raid_groups ORDER BY title COLLATE NOCASE"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [{"chat_id": row[0], "title": row[1]} for row in rows]
+
+
+def has_ban_rights(permissions) -> bool:
+    admin_rights = getattr(permissions, "admin_rights", None)
+    return bool(
+        getattr(permissions, "is_creator", False)
+        or getattr(admin_rights, "ban_users", False)
+    )
+
+async def check_subscriptions(user_id: int) -> tuple[bool | None, str | None]:
     channels = await get_channels()
     for ch in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except Exception:
-            return False
-    return True
+            subscribed = member.status in {"creator", "administrator", "member"}
+            subscribed = subscribed or (
+                member.status == "restricted" and bool(getattr(member, "is_member", False))
+            )
+            if not subscribed:
+                return False, ch["username"]
+        except Exception as exc:
+            log.warning(
+                "Obuna tekshirilmadi (%s, user %s): %s",
+                ch["username"], user_id, exc
+            )
+            return None, ch["username"]
+    return True, None
+
+
+def subscription_error_message(channel: str | None, check_failed: bool) -> str:
+    channel_name = html.escape(channel or "kanal")
+    if check_failed:
+        return (
+            f"⚠️ <b>{channel_name}</b> kanalini tekshirib bo'lmadi. "
+            "Botni shu kanalga admin qilib qo'shing va kanal username'i/ID'sini tekshiring."
+        )
+    return f"⚠️ Botdan foydalanish uchun <b>{channel_name}</b> kanaliga a'zo bo'ling:"
 
 # ─────────────────────────────────────────────
 # PRO HELPERS
@@ -248,28 +354,80 @@ RANDOM_UTAG_STICKERS = [
 
 
 async def get_utag_delay(uid: str) -> float:
-    """uTag oralig'ini bazadan oladi; eski bazalar uchun 1.5 soniya."""
+    """uTag oralig'ini bazadan oladi; sozlanmagan user uchun 0.5 soniya."""
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT delay FROM utag_settings WHERE owner_id = ?", (uid,)
         ) as cur:
             row = await cur.fetchone()
     try:
-        return max(0.5, min(float(row[0]), 10.0)) if row else 1.5
+        return max(0.5, min(float(row[0]), 10.0)) if row else 0.5
     except (TypeError, ValueError):
-        return 1.5
+        return 0.5
 
 
-def make_random_utag_text(user) -> str:
-    """Username saqlangan holda tasodifiy kulgili uTag matni yaratadi."""
+def get_custom_emoji_pack_name() -> str | None:
+    """Env qiymatidan emoji pack short name ni oladi."""
+    if not CUSTOM_EMOJI_PACK:
+        return None
+    if CUSTOM_EMOJI_PACK.startswith(("https://", "http://")):
+        parts = [part for part in urlparse(CUSTOM_EMOJI_PACK).path.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "addemoji":
+            return parts[1]
+        return None
+    return CUSTOM_EMOJI_PACK.strip("/") or None
+
+
+async def get_custom_emoji_pack(client: TelegramClient) -> list[tuple[int, str]]:
+    """Custom emoji pack hujjat ID va fallback belgilarini bir marta yuklaydi."""
+    if _custom_emoji_pack_cache:
+        return _custom_emoji_pack_cache
+
+    async with _custom_emoji_pack_lock:
+        if _custom_emoji_pack_cache:
+            return _custom_emoji_pack_cache
+        short_name = get_custom_emoji_pack_name()
+        if not short_name:
+            return []
+        try:
+            sticker_set = await client(GetStickerSetRequest(
+                InputStickerSetShortName(short_name), hash=0
+            ))
+            for document in sticker_set.documents:
+                custom_emoji = next((
+                    attribute for attribute in document.attributes
+                    if isinstance(attribute, DocumentAttributeCustomEmoji)
+                ), None)
+                if custom_emoji and custom_emoji.alt:
+                    _custom_emoji_pack_cache.append((document.id, custom_emoji.alt))
+        except Exception as exc:
+            log.warning("Custom emoji pack yuklanmadi: %s", exc)
+    return _custom_emoji_pack_cache
+
+
+def make_random_utag_text(
+    user, custom_emoji: tuple[int, str] | None = None
+) -> tuple[str, list[MessageEntityCustomEmoji]]:
+    """Username va tasodifiy so'z bilan uTag, pack emoji entitysi bilan."""
     username = getattr(user, "username", None)
     if username:
         mention = f"@{username}"
     else:
         mention = get_display_name(user).replace("#", "").strip() or "do'stimiz"
     word = random.choice(RANDOM_UTAG_WORDS)
-    sticker = random.choice(RANDOM_UTAG_STICKERS)
-    return f"{mention}, {word} {sticker}"
+    emoji_text = custom_emoji[1] if custom_emoji else random.choice(RANDOM_UTAG_STICKERS)
+    text = f"{mention}, {word} {emoji_text}"
+    if not custom_emoji:
+        return text, []
+
+    emoji_length = len(emoji_text.encode("utf-16-le")) // 2
+    text_length = len(text.encode("utf-16-le")) // 2
+    entity = MessageEntityCustomEmoji(
+        offset=text_length - emoji_length,
+        length=emoji_length,
+        document_id=custom_emoji[0],
+    )
+    return text, [entity]
 
 
 def build_auto_reply_text(response_text: str, pro: bool) -> str:
@@ -346,7 +504,7 @@ async def get_sub_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription"))
     return kb.as_markup()
 
-def get_main_keyboard() -> InlineKeyboardMarkup:
+def get_main_keyboard(has_pro: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="🔷 Userbotni sozlash", callback_data="btn_userbot"),
@@ -360,7 +518,22 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💠 User Yig'ish", callback_data="btn_scrape"),
         InlineKeyboardButton(text="⭐ Pro Tarif & Referal", callback_data="btn_pro_info")
     )
+    if has_pro:
+        kb.row(InlineKeyboardButton(text="🛡 Raid panel", callback_data="raid_panel"))
     return kb.as_markup()
+
+
+async def user_has_active_pro(user_id: int | str) -> bool:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT pro_until FROM users WHERE id = ?", (str(user_id),)
+        ) as cur:
+            row = await cur.fetchone()
+    return is_pro_user(row[0] if row else None)
+
+
+async def get_user_main_keyboard(user_id: int | str) -> InlineKeyboardMarkup:
+    return get_main_keyboard(await user_has_active_pro(user_id))
 
 def get_userbot_keyboard(acc_name: str | None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -438,14 +611,28 @@ async def pro_expiration_checker():
 
                         # Pro tugagan — bio dan reklamani olib tashlash (yo'q: qo'shish kerak)
                         if time_left <= 0:
-                            # Pro tugadi — agar userbot ulangan bo'lsa, bio ga reklama qo'sh
                             async with db.execute(
                                 "SELECT session FROM user_sessions WHERE user_id = ?", (uid,)
                             ) as sc:
                                 sess_row = await sc.fetchone()
                             if sess_row and uid in userbot_clients:
-                                client = userbot_clients[uid]
-                                await set_ad_bio(client, is_pro=False)
+                                try:
+                                    await set_ad_bio(userbot_clients[uid], is_pro=False)
+                                except Exception as exc:
+                                    log.warning("Expired PRO bio update failed (%s): %s", uid, exc)
+                            await db.execute(
+                                "UPDATE users SET pro_until = NULL, notified_10m = 0 WHERE id = ?",
+                                (uid,)
+                            )
+                            await db.commit()
+                            try:
+                                await bot.send_message(
+                                    int(uid),
+                                    "⭐ PRO muddati tugadi. Raid panel endi yopildi.",
+                                    reply_markup=await get_user_main_keyboard(uid)
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         continue
         except Exception as e:
@@ -455,14 +642,29 @@ async def pro_expiration_checker():
 # ─────────────────────────────────────────────
 # START & REFERRAL
 # ─────────────────────────────────────────────
+def get_start_message(first_name: str, user_id: int) -> str:
+    text = (
+        f"💠 Assalom alaykum, <b>{html.escape(first_name)}</b>!\n\n"
+        "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
+        "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin."
+    )
+    if str(user_id) in userbot_clients:
+        text += "\n\n" + get_utag_command_help()
+    return text
+
+
 @dp.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     uid = str(message.from_user.id)
 
-    if not await check_subscriptions(message.from_user.id):
+    subscribed, channel = await check_subscriptions(message.from_user.id)
+    if subscribed is None:
+        await message.answer(subscription_error_message(channel, check_failed=True))
+        return
+    if not subscribed:
         await message.answer(
-            "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
+            subscription_error_message(channel, check_failed=False),
             reply_markup=await get_sub_keyboard()
         )
         return
@@ -490,81 +692,127 @@ async def cmd_start(message: Message, state: FSMContext):
             )
             await db.commit()
 
-            if referrer_id:
+        if not user_exists and referrer_id:
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referrer_id = ?", (referrer_id,)
+            ) as cc:
+                ref_count = (await cc.fetchone())[0]
+
+            if ref_count > 0 and ref_count % 3 == 0:
                 async with db.execute(
-                    "SELECT COUNT(*) FROM users WHERE referrer_id = ?", (referrer_id,)
-                ) as cc:
-                    ref_count = (await cc.fetchone())[0]
+                    "SELECT pro_until FROM users WHERE id = ?", (referrer_id,)
+                ) as pc:
+                    row = await pc.fetchone()
+                    current_pro = row[0] if row else None
 
-                if ref_count > 0 and ref_count % 3 == 0:
-                    async with db.execute(
-                        "SELECT pro_until FROM users WHERE id = ?", (referrer_id,)
-                    ) as pc:
-                        row = await pc.fetchone()
-                        current_pro = row[0] if row else None
+                base_time = datetime.now(timezone.utc)
+                if current_pro and is_pro_user(current_pro):
+                    base_time = datetime.fromisoformat(current_pro)
 
-                    base_time = datetime.now(timezone.utc)
-                    if current_pro and is_pro_user(current_pro):
-                        base_time = datetime.fromisoformat(current_pro)
+                new_pro = (base_time + timedelta(days=3)).isoformat()
+                await db.execute(
+                    "UPDATE users SET pro_until = ?, notified_10m = 0 WHERE id = ?",
+                    (new_pro, referrer_id)
+                )
+                await db.commit()
 
-                    new_pro = (base_time + timedelta(days=3)).isoformat()
-                    await db.execute(
-                        "UPDATE users SET pro_until = ?, notified_10m = 0 WHERE id = ?",
-                        (new_pro, referrer_id)
+                if referrer_id in userbot_clients:
+                    await set_ad_bio(userbot_clients[referrer_id], is_pro=True)
+                try:
+                    await bot.send_message(
+                        int(referrer_id),
+                        "🎉 <b>Tabriklaymiz!</b> Siz 3 ta do'stingizni taklif qildingiz "
+                        "va sizga <b>3 kunlik PRO tarif</b> taqdim etildi!\n\n"
+                        "✅ Profil bio'ngizdan reklama olib tashlandi."
                     )
-                    await db.commit()
-
-                    # Pro berildi — bio dan reklamani o'chir
-                    if referrer_id in userbot_clients:
-                        await set_ad_bio(userbot_clients[referrer_id], is_pro=True)
-                    try:
-                        await bot.send_message(
-                            int(referrer_id),
-                            "🎉 <b>Tabriklaymiz!</b> Siz 3 ta do'stingizni taklif qildingiz "
-                            "va sizga <b>3 kunlik PRO tarif</b> taqdim etildi!\n\n"
-                            "✅ Profil bio'ngizdan reklama olib tashlandi."
-                        )
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     await message.answer(
-        f"💠 Assalom alaykum, <b>{message.from_user.first_name}</b>!\n\n"
-        "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
-        "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin.",
-        reply_markup=get_main_keyboard()
+        get_start_message(message.from_user.first_name or "", message.from_user.id),
+        reply_markup=await get_user_main_keyboard(message.from_user.id)
     )
 
 @dp.callback_query(F.data == "check_subscription")
 async def cb_check_sub(callback: CallbackQuery, state: FSMContext):
-    if await check_subscriptions(callback.from_user.id):
+    subscribed, channel = await check_subscriptions(callback.from_user.id)
+    if subscribed is True:
         await callback.answer("✅ Rahmat! Obuna tasdiqlandi.", show_alert=True)
         await callback.message.delete()
         await callback.message.answer(
-            f"💠 Assalom alaykum, <b>{callback.from_user.first_name}</b>!\n\n"
-            "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
-            "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin.",
-            reply_markup=get_main_keyboard()
+            get_start_message(callback.from_user.first_name or "", callback.from_user.id),
+            reply_markup=await get_user_main_keyboard(callback.from_user.id)
+        )
+    elif subscribed is None:
+        await callback.answer(
+            f"Kanalni tekshirib bo'lmadi: {channel}. Botni kanalga admin qiling.",
+            show_alert=True
         )
     else:
-        await callback.answer("❌ Hali barcha kanallarga a'zo bo'lmadingiz!", show_alert=True)
+        await callback.answer(f"Hali {channel} kanaliga a'zo emassiz.", show_alert=True)
 
 # ─────────────────────────────────────────────
 # MAIN MENU callback
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
-    if not await check_subscriptions(callback.from_user.id):
+    subscribed, channel = await check_subscriptions(callback.from_user.id)
+    if subscribed is not True:
         await callback.message.edit_text(
-            "⚠️ Avval kanallarga a'zo bo'ling:", reply_markup=await get_sub_keyboard()
+            subscription_error_message(channel, check_failed=subscribed is None),
+            reply_markup=await get_sub_keyboard()
         )
         return
     await state.clear()
     await callback.message.edit_text(
-        f"💠 Assalom alaykum, <b>{callback.from_user.first_name}</b>!\n\n"
-        "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
-        "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin.",
-        reply_markup=get_main_keyboard()
+        get_start_message(callback.from_user.first_name or "", callback.from_user.id),
+        reply_markup=await get_user_main_keyboard(callback.from_user.id)
     )
+
+
+@dp.callback_query(F.data == "raid_panel")
+async def cb_raid_panel(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    if not await user_has_active_pro(uid):
+        await callback.message.edit_reply_markup(
+            reply_markup=await get_user_main_keyboard(uid)
+        )
+        await callback.answer("Raid panel uchun faol PRO kerak.", show_alert=True)
+        return
+
+    groups = await get_raid_groups()
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT used_at FROM raid_usage WHERE user_id = ?", (uid,)
+        ) as cur:
+            row = await cur.fetchone()
+    limit_text = "Raid limiti: haftasiga 1 ta ban amali."
+    if row:
+        try:
+            used_at = datetime.fromisoformat(row[0])
+            if used_at.tzinfo is None:
+                used_at = used_at.replace(tzinfo=timezone.utc)
+            available_at = used_at + timedelta(days=7)
+            if datetime.now(timezone.utc) < available_at:
+                limit_text = (
+                    "Keyingi raid amali: "
+                    f"<b>{available_at.strftime('%Y-%m-%d %H:%M')} UTC</b> dan keyin."
+                )
+        except ValueError:
+            pass
+
+    group_text = "\n".join(
+        f"• {html.escape(group['title'])}" for group in groups
+    ) or "Hozircha admin paneldan guruh tanlanmagan."
+    await callback.message.edit_text(
+        "🛡 <b>Raid panel (PRO)</b>\n\n"
+        f"Ruxsatli guruhlar:\n{group_text}\n\n"
+        f"{limit_text}\n"
+        "Guruhda <code>.ban @username</code> yoki <code>.mban @username</code> "
+        "yozing. Amallar faqat ruxsatli ro'yxatdagi va profilingiz ban huquqiga ega guruhlarda bajariladi.",
+        reply_markup=back_kb("main_menu")
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data == "noop")
 async def cb_noop(callback: CallbackQuery):
@@ -586,8 +834,8 @@ async def cb_how_utag(callback: CallbackQuery):
         "📖 <b>uTag qanday ishlaydi?</b>\n\n"
         "1️⃣ Botga akkauntingizni ulang (<b>Userbotni sozlash</b>)\n"
         "2️⃣ Bot qo'shilgan guruhga kiring\n"
-        "3️⃣ Guruhda <code>.su</code> yoki <code>/su</code> yozing → uTag boshlanadi\n"
-        "4️⃣ Kulgili random uTag uchun <code>.ru</code> yoki <code>/ru</code> yozing\n"
+        "3️⃣ Guruhda <code>.s</code> yoki <code>/s</code> yozing → uTag boshlanadi\n"
+        "4️⃣ Random uTag uchun <code>.r</code> yoki <code>/r</code> yozing\n"
         "5️⃣ Guruhda <code>.f</code> yoki <code>/f</code> yozing → uTag to'xtatiladi\n\n"
         "⚡ uTag tezligini Sozlamalar → <b>uTag tezligini sozlash</b> bo'limidan "
         "o'zgartirishingiz mumkin.\n"
@@ -609,7 +857,7 @@ async def cb_utag_speed(callback: CallbackQuery):
         "⚡ <b>uTag tezligi</b>\n\n"
         f"Hozirgi tezlik: <b>har {delay:g} soniyada 1 ta tag</b>\n\n"
         "Tezlikni tanlang. Juda tez yuborish Telegram chekloviga olib kelishi "
-        "mumkin, shuning uchun xavfsiz variant sifatida 1.5–2 soniya tavsiya qilinadi.",
+        "mumkin; FloodWait chiqsa 1.5–2 soniyani tanlang.",
         reply_markup=get_utag_speed_keyboard(delay)
     )
 
@@ -773,54 +1021,238 @@ async def text_phone_input(message: Message, state: FSMContext):
     await process_phone_login(message, state, phone)
 
 async def process_phone_login(message: Message, state: FSMContext, phone: str):
+    digits = re.sub(r"\D", "", phone)
+    if not 7 <= len(digits) <= 15:
+        await message.answer("❌ Telefon raqami noto'g'ri. Xalqaro formatda qayta kiriting.")
+        return
+    phone = f"+{digits}"
     await message.answer("⏳ Telegram serveriga ulanish...", reply_markup=ReplyKeyboardRemove())
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     try:
         await client.connect()
         sent = await client.send_code_request(phone)
-        await state.update_data(temp_client=client, phone=phone, phone_code_hash=sent.phone_code_hash)
-        await message.answer("📩 Tasdiqlash kodi yuborildi. Kodni kiriting (masalan: 12345):")
+        await state.update_data(
+            temp_client=client, phone=phone,
+            phone_code_hash=sent.phone_code_hash, login_code=""
+        )
         await state.set_state(UserStatesGroup.login_code)
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
+        prompt = await message.answer(
+            login_code_prompt(""), reply_markup=get_login_code_keyboard()
+        )
+        await state.update_data(
+            login_code_prompt_chat_id=prompt.chat.id,
+            login_code_prompt_message_id=prompt.message_id,
+        )
+    except Exception as exc:
+        log.exception("Telegram login kodi so'ralmadi")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            "❌ Kod yuborilmadi. API_ID va API_HASH qiymatlarini tekshiring, "
+            "so'ng telefon raqamini qayta kiriting."
+        )
 
 @dp.message(StateFilter(UserStatesGroup.login_code), F.text)
 async def code_input(message: Message, state: FSMContext):
     code = re.sub(r"[.\s\-]", "", message.text.strip())
-    data   = await state.get_data()
-    client: TelegramClient = data.get("temp_client")
-    phone  = data.get("phone")
-    hash_v = data.get("phone_code_hash")
-    if not client:
-        await message.answer("⚠️ Sessiya eskirgan. Qaytadan urinib ko'ring.")
-        await state.clear()
+    if not code.isdigit():
+        await state.update_data(login_code="")
+        await refresh_login_code_prompt(state, "", "Faqat raqamli kod kiriting.")
         return
+    status, error = await submit_login_code(message.from_user.id, code, state)
+    if status == "twofa":
+        await message.answer(two_fa_prompt())
+    elif status == "retry":
+        await state.update_data(login_code="")
+        await refresh_login_code_prompt(state, "", error)
+    elif status == "expired":
+        await message.answer(error or "⌛ Kod muddati tugadi. Qaytadan urinib ko'ring.")
+
+
+async def submit_login_code(
+    user_id: int, code: str, state: FSMContext
+) -> tuple[str, str | None]:
+    data = await state.get_data()
+    client: TelegramClient = data.get("temp_client")
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+    if not client:
+        await state.clear()
+        return "expired", "⚠️ Sessiya eskirgan. Akkauntni qaytadan ulang."
+
     try:
-        await client.sign_in(phone, code, phone_code_hash=hash_v)
-        await finalize_login(message.from_user.id, client, phone, state)
-    except Exception as e:
-        err_str = str(e)
-        if "Password" in err_str or "SessionPasswordNeeded" in err_str or "Two-steps" in err_str:
-            await state.update_data(temp_client=client)
-            await state.set_state(UserStatesGroup.login_2fa)
-            await message.answer("🔒 2FA parolini kiriting:")
-        else:
-            await message.answer(f"❌ Kod xato yoki eskirgan: {e}")
+        await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+    except SessionPasswordNeededError:
+        await clear_login_code_keyboard(state)
+        await state.update_data(two_fa_password="")
+        await state.set_state(UserStatesGroup.login_2fa)
+        return "twofa", None
+    except PhoneCodeInvalidError:
+        return "retry", "❌ Tasdiqlash kodi noto'g'ri. Qayta kiriting."
+    except PhoneCodeExpiredError:
+        await clear_login_code_keyboard(state)
+        await client.disconnect()
+        await state.clear()
+        return "expired", "⌛ Kod muddati tugadi. Akkauntni qaytadan ulashni boshlang."
+    except Exception:
+        log.exception("Telegram tasdiqlash kodini tekshirishda xato")
+        return "retry", "❌ Kodni tekshirib bo'lmadi. Qaytadan urinib ko'ring."
+
+    await clear_login_code_keyboard(state)
+    await finalize_login(user_id, client, phone, state)
+    return "connected", None
+
+
+async def clear_login_code_keyboard(state: FSMContext):
+    data = await state.get_data()
+    chat_id = data.get("login_code_prompt_chat_id")
+    message_id = data.get("login_code_prompt_message_id")
+    if chat_id and message_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=None
+            )
+        except Exception:
+            pass
+
+
+async def refresh_login_code_prompt(
+    state: FSMContext, code: str, error: str | None = None
+):
+    data = await state.get_data()
+    chat_id = data.get("login_code_prompt_chat_id")
+    message_id = data.get("login_code_prompt_message_id")
+    if not chat_id or not message_id:
+        return
+    text = login_code_prompt(code)
+    if error:
+        text = f"❌ {html.escape(error)}\n\n{text}"
+    await bot.edit_message_text(
+        text=text,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=get_login_code_keyboard(),
+    )
+
+
+def login_code_prompt(code: str) -> str:
+    masked_code = "●" * len(code) or "—"
+    return (
+        "📩 <b>Telegram tasdiqlash kodi</b>\n\n"
+        "Kodni matn qilib yuboring yoki quyidagi raqamli klaviaturadan kiriting.\n"
+        f"Kiritildi: <code>{masked_code}</code>"
+    )
+
+
+def get_login_code_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for digits in ("123", "456", "789"):
+        kb.row(*[
+            InlineKeyboardButton(text=digit, callback_data=f"login_code:digit:{digit}")
+            for digit in digits
+        ])
+    kb.row(
+        InlineKeyboardButton(text="⌫", callback_data="login_code:back"),
+        InlineKeyboardButton(text="0", callback_data="login_code:digit:0"),
+        InlineKeyboardButton(text="🧹", callback_data="login_code:clear"),
+    )
+    kb.row(InlineKeyboardButton(text="✅ Kodni tekshirish", callback_data="login_code:submit"))
+    kb.row(InlineKeyboardButton(text="✖️ Bekor qilish", callback_data="login_code:cancel"))
+    return kb.as_markup()
+
+
+@dp.callback_query(StateFilter(UserStatesGroup.login_code), F.data.startswith("login_code:"))
+async def login_code_keypad_input(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    code = data.get("login_code", "")
+    action = callback.data.removeprefix("login_code:")
+
+    if action == "cancel":
+        client = data.get("temp_client")
+        if client:
+            await client.disconnect()
+        await state.clear()
+        await callback.message.edit_text(
+            "Akkaunt ulash bekor qilindi.",
+            reply_markup=await get_user_main_keyboard(callback.from_user.id)
+        )
+        await callback.answer()
+        return
+
+    if action.startswith("digit:"):
+        digit = action.split(":", 1)[1]
+        if digit in "0123456789" and len(code) < 10:
+            code += digit
+    elif action == "back":
+        code = code[:-1]
+    elif action == "clear":
+        code = ""
+    elif action == "submit":
+        if not code:
+            await callback.answer("Avval kodni kiriting.", show_alert=True)
+            return
+        status, error = await submit_login_code(callback.from_user.id, code, state)
+        if status == "twofa":
+            await callback.message.edit_text(two_fa_prompt(), reply_markup=None)
+        elif status == "retry":
+            await state.update_data(login_code="")
+            await callback.message.edit_text(
+                f"❌ {html.escape(error or 'Kod noto\'g\'ri.')}\n\n{login_code_prompt('')}",
+                reply_markup=get_login_code_keyboard(),
+            )
+        elif status == "expired":
+            await callback.message.edit_text(html.escape(error or "Sessiya muddati tugadi."))
+        await callback.answer("Kod qabul qilindi." if status == "connected" else None)
+        return
+    else:
+        await callback.answer()
+        return
+
+    await state.update_data(login_code=code)
+    await callback.message.edit_text(
+        login_code_prompt(code), reply_markup=get_login_code_keyboard()
+    )
+    await callback.answer()
+
+
+def two_fa_prompt() -> str:
+    return (
+        "🔒 <b>Ikki bosqichli himoya</b>\n\n"
+        "Telegram akkauntingizning 2FA parolini matn qilib yuboring."
+    )
+
+
+async def attempt_two_fa_login(user_id: int, password: str, state: FSMContext) -> str | None:
+    data = await state.get_data()
+    client: TelegramClient = data.get("temp_client")
+    phone = data.get("phone")
+    if not client:
+        await state.clear()
+        return "Sessiya muddati tugadi. Akkauntni qaytadan ulang."
+    try:
+        await client.sign_in(password=password)
+    except PasswordHashInvalidError:
+        return "Parol noto'g'ri. Qayta kiriting."
+    except Exception as exc:
+        log.exception("Ikki bosqichli parolni tekshirishda xato")
+        return "Parolni tekshirib bo'lmadi. Qaytadan urinib ko'ring."
+    await finalize_login(user_id, client, phone, state)
+    return None
+
 
 @dp.message(StateFilter(UserStatesGroup.login_2fa), F.text)
 async def two_fa_input(message: Message, state: FSMContext):
-    data   = await state.get_data()
-    client: TelegramClient = data.get("temp_client")
-    phone  = data.get("phone")
-    if not client:
-        await message.answer("⚠️ Sessiya eskirgan.")
-        await state.clear()
+    password = message.text.strip()
+    if not password:
+        await message.answer("❌ Parol bo'sh bo'lmasin.")
         return
-    try:
-        await client.sign_in(password=message.text.strip())
-        await finalize_login(message.from_user.id, client, phone, state)
-    except Exception as e:
-        await message.answer(f"❌ Parol noto'g'ri: {e}\nQaytadan kiriting:")
+    error = await attempt_two_fa_login(message.from_user.id, password, state)
+    if error:
+        await message.answer(
+            f"❌ {html.escape(error)}\n\n{two_fa_prompt()}"
+        )
 
 async def finalize_login(user_id: int, client: TelegramClient, phone: str, state: FSMContext):
     me          = await client.get_me()
@@ -848,15 +1280,13 @@ async def finalize_login(user_id: int, client: TelegramClient, phone: str, state
     await set_ad_bio(client, is_pro=pro)
 
     await state.clear()
-
-tarif_text = "🟢 PRO tarif faol - reklama yo‘q" if pro else "🔴 Oddiy tarif - reklama bio ga qo‘yildi"
-
-await bot.send_message(
-    user_id,
-    f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
-    f"{tarif_text}",
-    reply_markup=get_main_keyboard()
-)
+    await bot.send_message(
+        user_id,
+        f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
+        f"{'🟢 PRO tarif faol — reklama yo\'q' if pro else '🔴 Oddiy tarif — reklama bio ga qo\'yildi'}\n\n"
+        f"{get_utag_command_help()}",
+        reply_markup=await get_user_main_keyboard(user_id)
+    )
 
 # ─────────────────────────────────────────────
 # LOGOUT
@@ -866,7 +1296,9 @@ async def cb_logout(callback: CallbackQuery, state: FSMContext):
     uid = str(callback.from_user.id)
     # uTag ni to'xtat
     if uid in _utag_tasks and not _utag_tasks[uid].done():
-        _utag_tasks[uid].cancel()
+        task = _utag_tasks[uid]
+        _utag_suppress_ad_tasks.add(task)
+        task.cancel()
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("DELETE FROM user_sessions WHERE user_id = ?", (uid,))
@@ -903,21 +1335,35 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
         participants = await client.get_participants(chat, limit=500)
         me = await client.get_me()
         delay = await get_utag_delay(uid)
+        custom_emojis = await get_custom_emoji_pack(client) if random_mode else []
         tagged = 0
+        seen_usernames: set[str] = set()
 
         for user in participants:
             if uid not in _utag_tasks or _utag_tasks[uid].done():
                 break  # To'xtatildi
             if user.id == me.id or user.bot:
                 continue
+            username = getattr(user, "username", None)
+            username_key = username.casefold() if username else ""
+            if not username_key or username_key in seen_usernames:
+                continue
+            seen_usernames.add(username_key)
             try:
                 if random_mode:
-                    # .ru va /ru uchun har bir tagda yangi kulgili so'z/sticker.
-                    tag_text = make_random_utag_text(user)
+                    custom_emoji = random.choice(custom_emojis) if custom_emojis else None
+                    tag_text, entities = make_random_utag_text(user, custom_emoji)
                 else:
-                    uname = f"@{user.username}" if user.username else get_display_name(user)
-                    tag_text = make_text_unique(uname.replace("#", ""))
-                await client.send_message(chat, tag_text)
+                    tag_text = make_text_unique(f"@{username}")
+                    entities = []
+                try:
+                    await client.send_message(
+                        chat, tag_text, formatting_entities=entities or None
+                    )
+                except (PremiumAccountRequiredError, EntityBoundsInvalidError):
+                    if not entities:
+                        raise
+                    await client.send_message(chat, tag_text)
                 tagged += 1
                 await asyncio.sleep(delay)
             except FloodWaitError as e:
@@ -936,8 +1382,10 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
                 pass
 
     except asyncio.CancelledError:
-        # To'xtatildi — reklama (pro bo'lmasa)
-        if not pro:
+        current_task = asyncio.current_task()
+        suppress_ad = current_task in _utag_suppress_ad_tasks
+        _utag_suppress_ad_tasks.discard(current_task)
+        if not pro and not suppress_ad:
             try:
                 await client.send_message(chat, AD_TEXT)
             except Exception:
@@ -994,13 +1442,15 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
         except Exception as exc:
             log.error(f"Avto javob xatosi ({uid}): {exc}")
 
-    @client.on(events.NewMessage(pattern=r'^[./](su)$', incoming=False, outgoing=True))
+    @client.on(events.NewMessage(pattern=r'^[./](s|su)$', incoming=False, outgoing=True))
     async def on_start_utag(event):
         if event.chat_id is None:
             return
         # Avvalgi taskni bekor qil
         if uid in _utag_tasks and not _utag_tasks[uid].done():
-            _utag_tasks[uid].cancel()
+            old_task = _utag_tasks[uid]
+            _utag_suppress_ad_tasks.add(old_task)
+            old_task.cancel()
             await asyncio.sleep(0.5)
         task = asyncio.create_task(do_utag(client, uid, event, random_mode=False))
         _utag_tasks[uid] = task
@@ -1009,13 +1459,15 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
         except Exception:
             pass
 
-    @client.on(events.NewMessage(pattern=r'^[./](ru)$', incoming=False, outgoing=True))
+    @client.on(events.NewMessage(pattern=r'^[./](r|ru)$', incoming=False, outgoing=True))
     async def on_start_random_utag(event):
         """.ru yoki /ru — har bir userga random so'z va sticker bilan uTag."""
         if event.chat_id is None:
             return
         if uid in _utag_tasks and not _utag_tasks[uid].done():
-            _utag_tasks[uid].cancel()
+            old_task = _utag_tasks[uid]
+            _utag_suppress_ad_tasks.add(old_task)
+            old_task.cancel()
             await asyncio.sleep(0.5)
         task = asyncio.create_task(do_utag(client, uid, event, random_mode=True))
         _utag_tasks[uid] = task
@@ -1032,6 +1484,93 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
             await event.delete()
         except Exception:
             pass
+
+    @client.on(events.NewMessage(
+        pattern=r'^[./](?:mban|ban)\s+(@[A-Za-z0-9_]{5,32})\s*$',
+        incoming=False,
+        outgoing=True,
+    ))
+    async def on_raid_ban(event):
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        if not await user_has_active_pro(uid):
+            await event.respond("Raid uchun faol PRO kerak.")
+            return
+
+        lock = _raid_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            async with aiosqlite.connect(DB_FILE) as db:
+                async with db.execute(
+                    "SELECT used_at FROM raid_usage WHERE user_id = ?", (uid,)
+                ) as cur:
+                    usage = await cur.fetchone()
+            if usage:
+                try:
+                    used_at = datetime.fromisoformat(usage[0])
+                    if used_at.tzinfo is None:
+                        used_at = used_at.replace(tzinfo=timezone.utc)
+                    available_at = used_at + timedelta(days=7)
+                    if datetime.now(timezone.utc) < available_at:
+                        await event.respond(
+                            "Raid limiti haftasiga 1 marta. Keyingi amal: "
+                            f"{available_at.strftime('%Y-%m-%d %H:%M')} UTC dan keyin."
+                        )
+                        return
+                except ValueError:
+                    pass
+
+            groups = await get_raid_groups()
+            if not groups:
+                await event.respond("Raid guruhlari admin paneldan hali tanlanmagan.")
+                return
+            username = event.pattern_match.group(1)
+            try:
+                target = await client.get_entity(username)
+                me = await client.get_me()
+                if getattr(target, "id", None) == me.id:
+                    await event.respond("O'z akkauntingizni ban qilib bo'lmaydi.")
+                    return
+            except Exception:
+                await event.respond(f"{username} topilmadi yoki akkaunt ko'ra olmaydi.")
+                return
+
+            banned_groups: list[str] = []
+            no_rights: list[str] = []
+            for group in groups:
+                try:
+                    entity = await client.get_entity(int(group["chat_id"]))
+                    permissions = await client.get_permissions(entity, me)
+                    if not has_ban_rights(permissions):
+                        no_rights.append(group["title"])
+                        continue
+                    await client.edit_permissions(entity, target, view_messages=False)
+                    banned_groups.append(group["title"])
+                except FloodWaitError as exc:
+                    log.warning("Raid ban FloodWait (%s): %s", group["title"], exc)
+                    break
+                except Exception as exc:
+                    log.warning("Raid ban failed in %s: %s", group["title"], exc)
+
+            if banned_groups:
+                used_at = datetime.now(timezone.utc).isoformat()
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute(
+                        "INSERT INTO raid_usage (user_id, used_at) VALUES (?, ?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET used_at = excluded.used_at",
+                        (uid, used_at)
+                    )
+                    await db.commit()
+                group_list = ", ".join(html.escape(name) for name in banned_groups)
+                await event.respond(
+                    f"✅ {html.escape(username)} ban qilindi ({len(banned_groups)} guruh): {group_list}"
+                )
+            elif no_rights:
+                names = ", ".join(html.escape(name) for name in no_rights)
+                await event.respond(f"Hech bir guruhda ban huquqi yo'q: {names}")
+            else:
+                await event.respond(f"{html.escape(username)} hech qaysi ruxsatli guruhda ban qilinmadi.")
 
 # ─────────────────────────────────────────────
 # AVTO XABAR
@@ -1086,7 +1625,7 @@ async def auto_msg_send(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ Yuborildi: <b>{sent}</b>\n❌ Muvaffaqiyatsiz: <b>{failed}</b>",
-        reply_markup=get_main_keyboard()
+        reply_markup=await get_user_main_keyboard(message.from_user.id)
     )
     await state.clear()
 
@@ -1173,7 +1712,7 @@ async def auto_reply_text_input(message: Message, state: FSMContext):
         "✅ Avto javob yoqildi va bazaga saqlandi.\n"
         "Akkauntingiz offline bo'lganda foydalanuvchiga javob yuboriladi.\n"
         "Oddiy tarifda reklama matn tagiga qo'shiladi, PRO tarifda esa reklama chiqmaydi.",
-        reply_markup=get_main_keyboard()
+        reply_markup=await get_user_main_keyboard(message.from_user.id)
     )
 
 
@@ -1206,6 +1745,28 @@ def get_scrape_groups_keyboard(uid: str) -> InlineKeyboardMarkup:
             callback_data=f"scrape_group:{key}"
         ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
+    return kb.as_markup()
+
+
+def get_scrape_count_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    buttons = [
+        InlineKeyboardButton(text=f"👥 {count}", callback_data=f"scrape_count:{count}")
+        for count in (100, 200, 500, 1000, 1500)
+    ]
+    kb.row(*buttons[:3])
+    kb.row(*buttons[3:])
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_scrape"))
+    return kb.as_markup()
+
+
+def get_scrape_mode_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="⚡ Tez terish", callback_data="scrape_mode:fast"),
+        InlineKeyboardButton(text="🐢 Sekin terish", callback_data="scrape_mode:slow"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_scrape"))
     return kb.as_markup()
 
 
@@ -1266,21 +1827,35 @@ async def cb_scrape_group_selected(callback: CallbackQuery, state: FSMContext):
     await state.update_data(scrape_group_key=key)
     await callback.message.edit_text(
         f"✅ Tanlandi: <b>{html.escape(str(choice['title']))}</b>\n\n"
-        "Nechta foydalanuvchi yig'ish kerak? (maksimal 500):",
-        reply_markup=back_kb("btn_scrape")
+        "Terish usulini tanlang:",
+        reply_markup=get_scrape_mode_keyboard()
     )
-    await state.set_state(UserStatesGroup.scrape_count)
+    await state.set_state(UserStatesGroup.scrape_mode)
 
 
-@dp.message(StateFilter(UserStatesGroup.scrape_count), F.text)
-async def scrape_count_input(message: Message, state: FSMContext):
-    try:
-        count = max(1, min(int(message.text.strip()), 500))
-    except ValueError:
-        await message.answer("❌ Faqat 1 dan 500 gacha raqam kiriting.")
+@dp.callback_query(F.data.startswith("scrape_mode:"))
+async def cb_scrape_mode(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id <= 0 or callback.message is None:
+        await callback.answer("❌ So'rovni bajarib bo'lmadi.", show_alert=True)
         return
+    mode = callback.data.split(":", 1)[1]
+    if mode not in {"fast", "slow"}:
+        await callback.answer("❌ Noto'g'ri rejim.", show_alert=True)
+        return
+    await state.update_data(scrape_mode=mode)
+    await state.set_state(UserStatesGroup.scrape_count)
+    mode_label = "Tez" if mode == "fast" else "Sekin"
+    await callback.message.edit_text(
+        f"⚙️ Rejim: <b>{mode_label} terish</b>\n\n"
+        "Nechta foydalanuvchi yig'ish kerak? 100, 200, 500, 1000 yoki 1500 ni tanlang:",
+        reply_markup=get_scrape_count_keyboard()
+    )
+    await callback.answer()
 
-    uid = str(message.from_user.id)
+
+async def run_scrape_for_count(
+    message: Message, state: FSMContext, uid: str, count: int, mode: str
+):
     client = userbot_clients.get(uid)
     data = await state.get_data()
     choice = _scrape_group_choices.get(uid, {}).get(data.get("scrape_group_key", ""))
@@ -1291,21 +1866,26 @@ async def scrape_count_input(message: Message, state: FSMContext):
 
     group = choice["entity"]
     group_title = str(choice["title"])
+    message_limit = 1000 if mode == "fast" else None
+    mode_label = "tez" if mode == "fast" else "sekin"
     await message.answer(
-        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi xabar mualliflari tahlil qilinmoqda..."
+        f"⏳ <b>{html.escape(group_title)}</b> guruhidagi xabarlar {mode_label} rejimda tahlil qilinmoqda..."
     )
 
     try:
         me = await client.get_me()
         found: dict[int, tuple[str, str, str]] = {}
-        async for item in client.iter_messages(group, limit=10000):
+        async for item in client.iter_messages(group, limit=message_limit):
             sender = await item.get_sender()
             if not sender or getattr(sender, "bot", False):
                 continue
             sender_id = getattr(sender, "id", None)
             if not sender_id or sender_id == me.id or sender_id in found:
                 continue
-            username = f"@{sender.username}" if getattr(sender, "username", None) else ""
+            sender_username = getattr(sender, "username", None)
+            if not sender_username:
+                continue
+            username = f"@{sender_username}"
             fullname = get_display_name(sender).strip()
             found[int(sender_id)] = (username, fullname, str(sender_id))
             if len(found) >= count:
@@ -1336,17 +1916,78 @@ async def scrape_count_input(message: Message, state: FSMContext):
             f"✅ Foydalanuvchilar yig'ildi va bazaga saqlandi!\n\n"
             f"🆕 Yangi saqlanganlar: <b>{len(rows)}</b> ta\n"
             f"👥 Jami topilgan: <b>{len(found)}</b> ta\n\n"
-            "Ma'lumotlar faylga emas, SQLite bazaga saqlandi.",
-            reply_markup=get_main_keyboard()
+            "Ro'yxat shaxsiy chatga 150 tadan bo'lib yuboriladi.",
+            reply_markup=await get_user_main_keyboard(uid)
         )
+        if found:
+            batch: list[str] = []
+            batch_chars = 0
+            for username, _, _ in found.values():
+                extra_chars = len(username) + (1 if batch else 0)
+                if batch and (len(batch) >= 150 or batch_chars + extra_chars > 3900):
+                    await bot.send_message(chat_id=int(uid), text="\n".join(batch))
+                    batch = []
+                    batch_chars = 0
+                    extra_chars = len(username)
+                batch.append(username)
+                batch_chars += extra_chars
+            if batch:
+                await bot.send_message(chat_id=int(uid), text="\n".join(batch))
+        else:
+            await bot.send_message(
+                chat_id=int(uid), text="Username’li foydalanuvchi topilmadi."
+            )
     except Exception as exc:
         log.error(f"User yig'ishda xato ({uid}): {exc}")
         await message.answer(
             "❌ Guruh xabarlarini o'qib bo'lmadi. "
             "Akkaunt guruhga a'zo ekanini va xabarlar tarixini ko'ra olishini tekshiring.",
-            reply_markup=get_main_keyboard()
+            reply_markup=await get_user_main_keyboard(uid)
         )
     await state.clear()
+
+
+@dp.callback_query(F.data.startswith("scrape_count:"))
+async def cb_scrape_count(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id <= 0 or callback.message is None:
+        await callback.answer("❌ So'rovni bajarib bo'lmadi.", show_alert=True)
+        return
+    try:
+        count = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("❌ Noto'g'ri son.", show_alert=True)
+        return
+    if count not in (100, 200, 500, 1000, 1500):
+        await callback.answer("❌ Noto'g'ri son.", show_alert=True)
+        return
+    data = await state.get_data()
+    mode = data.get("scrape_mode")
+    if mode not in {"fast", "slow"}:
+        await callback.answer("❌ Avval terish usulini tanlang.", show_alert=True)
+        return
+
+    await callback.answer(f"{count} ta tanlandi")
+    await run_scrape_for_count(
+        callback.message, state, str(callback.from_user.id), count, mode
+    )
+
+
+@dp.message(StateFilter(UserStatesGroup.scrape_count), F.text)
+async def scrape_count_input(message: Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Tugmalardan birini tanlang yoki 1 dan 1500 gacha son kiriting.")
+        return
+    if not 1 <= count <= 1500:
+        await message.answer("❌ 1 dan 1500 gacha son kiriting.")
+        return
+    data = await state.get_data()
+    mode = data.get("scrape_mode")
+    if mode not in {"fast", "slow"}:
+        await message.answer("❌ Avval tez yoki sekin terishni tanlang.")
+        return
+    await run_scrape_for_count(message, state, str(message.from_user.id), count, mode)
 
 # ─────────────────────────────────────────────
 # ADMIN PANEL
@@ -1359,7 +2000,30 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="🎉 Konkurs yaratish", callback_data="admin_contest_create"))
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
     kb.row(InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="admin_broadcast"))
+    kb.row(InlineKeyboardButton(text="😀 Custom emoji pack", callback_data="admin_custom_emoji"))
+    kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
     return kb.as_markup()
+
+
+def normalize_custom_emoji_pack(value: str) -> str | None:
+    value = value.strip()
+    if value.lower() in {"/off", "off"}:
+        return ""
+    if value.startswith(("https://", "http://")):
+        parsed = urlparse(value)
+        parts = [part for part in parsed.path.split("/") if part]
+        if (
+            parsed.netloc.lower() not in {"t.me", "www.t.me", "telegram.me"}
+            or len(parts) != 2
+            or parts[0] != "addemoji"
+        ):
+            return None
+        value = parts[1]
+    elif "/" in value:
+        return None
+    value = value.strip("/")
+    return value if re.fullmatch(r"[A-Za-z0-9_]+", value) else None
+
 
 def get_admin_channels_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1369,6 +2033,21 @@ def get_admin_channels_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
             callback_data=f"del_channel:{ch['username']}"
         ))
     kb.row(InlineKeyboardButton(text="➕ Kanal qo'shish", callback_data="admin_add_channel"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
+    return kb.as_markup()
+
+
+def get_admin_raid_groups_keyboard(groups: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for group in groups:
+        kb.row(InlineKeyboardButton(
+            text=f"🗑 {group['title'][:40]}",
+            callback_data=f"admin_raid_del:{group['chat_id']}"
+        ))
+    kb.row(InlineKeyboardButton(
+        text="➕ Ban huquqi bor guruh qo'shish",
+        callback_data="admin_raid_add_group"
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     return kb.as_markup()
 
@@ -1450,6 +2129,395 @@ async def cb_admin_panel(callback: CallbackQuery):
         await callback.message.edit_text("🔐 <b>Admin Panel</b>", reply_markup=get_admin_keyboard())
     except Exception:
         await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_custom_emoji")
+async def cb_admin_custom_emoji(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    current = get_custom_emoji_pack_name() or "Sozlanmagan"
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(
+        text="➕ Pack qo'shish / almashtirish",
+        callback_data="admin_custom_emoji_set"
+    ))
+    kb.row(InlineKeyboardButton(
+        text="🎨 Tugmalar emoji'larini sozlash",
+        callback_data="admin_button_emojis"
+    ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
+    await callback.message.edit_text(
+        "😀 <b>Custom emoji pack</b>\n\n"
+        f"Joriy pack: <code>{html.escape(current)}</code>\n"
+        "Pack havolasi yoki short name yuboring. O'chirish uchun /off yozing.",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "admin_custom_emoji_set")
+async def cb_admin_custom_emoji_set(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Custom emoji pack havolasini (https://t.me/addemoji/...) yoki short name'ni yuboring.\n"
+        "Packni o'chirish uchun /off yozing.",
+        reply_markup=back_kb("admin_custom_emoji")
+    )
+    await state.set_state(UserStatesGroup.admin_custom_emoji_pack)
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_custom_emoji_pack), F.text)
+async def admin_custom_emoji_pack_input(message: Message, state: FSMContext):
+    global CUSTOM_EMOJI_PACK
+    if message.from_user.id != ADMIN_ID:
+        return
+    pack_name = normalize_custom_emoji_pack(message.text)
+    if pack_name is None:
+        await message.answer(
+            "❌ Pack havolasi noto'g'ri. https://t.me/addemoji/SHORT_NAME yoki short name yuboring."
+        )
+        return
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ('custom_emoji_pack', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (pack_name,)
+        )
+        await db.commit()
+    async with _custom_emoji_pack_lock:
+        CUSTOM_EMOJI_PACK = pack_name
+        _custom_emoji_pack_cache.clear()
+
+    await state.clear()
+    result = "o'chirildi" if not pack_name else f"<code>{html.escape(pack_name)}</code> saqlandi"
+    await message.answer(
+        f"✅ Custom emoji pack {result}.",
+        reply_markup=get_admin_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "admin_raid_groups")
+async def cb_admin_raid_groups(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    groups = await get_raid_groups()
+    listing = "\n".join(
+        f"• {html.escape(group['title'])}" for group in groups
+    ) or "Hali guruh tanlanmagan."
+    await callback.message.edit_text(
+        "🛡 <b>Raid uchun ruxsatli guruhlar</b>\n\n"
+        f"{listing}\n\n"
+        "Faqat admin userbot akkauntida ban huquqi bor guruhlarni qo'shish mumkin.",
+        reply_markup=get_admin_raid_groups_keyboard(groups)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_raid_add_group")
+async def cb_admin_raid_add_group(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    if str(ADMIN_ID) not in userbot_clients:
+        await callback.answer("Avval admin userbot akkauntini ulang.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Guruhning @username, t.me havolasi yoki ID'sini yuboring. "
+        "Admin akkauntida ban huquqi tekshiriladi.",
+        reply_markup=back_kb("admin_raid_groups")
+    )
+    await state.set_state(UserStatesGroup.admin_raid_add_group)
+
+
+@dp.message(StateFilter(UserStatesGroup.admin_raid_add_group), F.text)
+async def admin_raid_add_group_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    client = userbot_clients.get(str(ADMIN_ID))
+    if not client:
+        await message.answer("❌ Avval admin userbot akkauntini ulang.")
+        await state.clear()
+        return
+    try:
+        entity = await client.get_entity(message.text.strip())
+        is_group = isinstance(entity, Chat) or bool(getattr(entity, "megagroup", False))
+        if not is_group:
+            await message.answer("❌ Bu oddiy guruh yoki superguruh emas.")
+            return
+        me = await client.get_me()
+        permissions = await client.get_permissions(entity, me)
+        if not has_ban_rights(permissions):
+            await message.answer("❌ Admin akkauntida bu guruhda ban huquqi yo'q.")
+            return
+        chat_id = str(get_peer_id(entity))
+        title = get_display_name(entity) or str(chat_id)
+    except Exception as exc:
+        log.warning("Raid guruhini tekshirishda xato: %s", exc)
+        await message.answer(
+            "❌ Guruhni ochib bo'lmadi. Akkaunt guruhga a'zo va ban huquqiga ega ekanini tekshiring."
+        )
+        return
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO raid_groups (chat_id, title, added_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title",
+            (chat_id, title, datetime.now(timezone.utc).isoformat())
+        )
+        await db.commit()
+    await state.clear()
+    groups = await get_raid_groups()
+    await message.answer(
+        f"✅ <b>{html.escape(title)}</b> raid guruhlariga qo'shildi.",
+        reply_markup=get_admin_raid_groups_keyboard(groups)
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_raid_del:"))
+async def cb_admin_raid_del(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    chat_id = callback.data.split(":", 1)[1]
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM raid_groups WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+    groups = await get_raid_groups()
+    listing = "\n".join(
+        f"• {html.escape(group['title'])}" for group in groups
+    ) or "Hali guruh tanlanmagan."
+    await callback.message.edit_text(
+        f"🛡 <b>Raid uchun ruxsatli guruhlar</b>\n\n{listing}",
+        reply_markup=get_admin_raid_groups_keyboard(groups)
+    )
+    await callback.answer("✅ Guruh o'chirildi.")
+
+
+BUTTON_EMOJI_PAGE_SIZE = 20
+
+
+def get_button_emoji_targets_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    global _button_emoji_target_keys
+    items = sorted(
+        _button_catalog.items(),
+        key=lambda item: (item[1].casefold(), item[0])
+    )
+    _button_emoji_target_keys = [key for key, _ in items]
+    page_count = max(1, (len(items) + BUTTON_EMOJI_PAGE_SIZE - 1) // BUTTON_EMOJI_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    start = page * BUTTON_EMOJI_PAGE_SIZE
+    kb = InlineKeyboardBuilder()
+    for index, (key, label) in enumerate(
+        items[start:start + BUTTON_EMOJI_PAGE_SIZE], start
+    ):
+        kb.row(InlineKeyboardButton(
+            text=label[:55],
+            callback_data=f"button_emoji_target:{index}",
+            icon_custom_emoji_id=_button_custom_emoji_ids.get(key)
+        ))
+    if page_count > 1:
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton(
+                text="⬅️", callback_data=f"button_emoji_targets_page:{page - 1}"
+            ))
+        navigation.append(InlineKeyboardButton(
+            text=f"{page + 1}/{page_count}", callback_data="button_emoji_page_noop"
+        ))
+        if page + 1 < page_count:
+            navigation.append(InlineKeyboardButton(
+                text="➡️", callback_data=f"button_emoji_targets_page:{page + 1}"
+            ))
+        kb.row(*navigation)
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_custom_emoji"))
+    return kb.as_markup()
+
+
+def get_button_emoji_pack_keyboard(page: int, target_page: int) -> InlineKeyboardMarkup:
+    page_count = max(
+        1, (len(_custom_emoji_pack_cache) + BUTTON_EMOJI_PAGE_SIZE - 1)
+        // BUTTON_EMOJI_PAGE_SIZE
+    )
+    page = max(0, min(page, page_count - 1))
+    start = page * BUTTON_EMOJI_PAGE_SIZE
+    kb = InlineKeyboardBuilder()
+    buttons = [
+        InlineKeyboardButton(
+            text=alt or "⭐",
+            callback_data=f"button_emoji_pick:{index}",
+            icon_custom_emoji_id=str(document_id)
+        )
+        for index, (document_id, alt) in enumerate(
+            _custom_emoji_pack_cache[start:start + BUTTON_EMOJI_PAGE_SIZE], start
+        )
+    ]
+    for offset in range(0, len(buttons), 4):
+        kb.row(*buttons[offset:offset + 4])
+    if page_count > 1:
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton(
+                text="⬅️", callback_data=f"button_emoji_pack_page:{page - 1}"
+            ))
+        navigation.append(InlineKeyboardButton(
+            text=f"{page + 1}/{page_count}", callback_data="button_emoji_page_noop"
+        ))
+        if page + 1 < page_count:
+            navigation.append(InlineKeyboardButton(
+                text="➡️", callback_data=f"button_emoji_pack_page:{page + 1}"
+            ))
+        kb.row(*navigation)
+    kb.row(InlineKeyboardButton(
+        text="🗑 Emoji'ni olib tashlash", callback_data="button_emoji_clear"
+    ))
+    kb.row(InlineKeyboardButton(
+        text="⬅️ Tugmalar", callback_data=f"button_emoji_targets_page:{target_page}"
+    ))
+    return kb.as_markup()
+
+
+async def show_button_emoji_targets(callback: CallbackQuery, page: int = 0):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    if not _button_catalog:
+        await callback.answer("Tugmalar ro'yxati hali bo'sh.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🎨 <b>Custom emoji qo'yiladigan tugmani tanlang</b>",
+        reply_markup=get_button_emoji_targets_keyboard(page)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_button_emojis")
+async def cb_admin_button_emojis(callback: CallbackQuery):
+    await show_button_emoji_targets(callback)
+
+
+@dp.callback_query(F.data == "button_emoji_page_noop")
+async def cb_button_emoji_page_noop(callback: CallbackQuery):
+    if callback.from_user.id == ADMIN_ID:
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_targets_page:"))
+async def cb_button_emoji_targets_page(callback: CallbackQuery):
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Sahifa noto'g'ri.", show_alert=True)
+        return
+    await show_button_emoji_targets(callback, page)
+
+
+@dp.callback_query(F.data.startswith("button_emoji_target:"))
+async def cb_button_emoji_target(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    try:
+        index = int(callback.data.rsplit(":", 1)[1])
+        target_key = _button_emoji_target_keys[index]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Tugma ro'yxati eskirgan. Qaytadan oching.", show_alert=True)
+        return
+    client = userbot_clients.get(str(ADMIN_ID))
+    if not client:
+        await callback.answer("Avval admin akkauntini botga ulang.", show_alert=True)
+        return
+    emojis = await get_custom_emoji_pack(client)
+    if not emojis:
+        await callback.answer("Custom emoji pack yuklanmadi yoki bo'sh.", show_alert=True)
+        return
+
+    target_page = index // BUTTON_EMOJI_PAGE_SIZE
+    await state.update_data(button_emoji_target=target_key, button_emoji_target_page=target_page)
+    label = html.escape(_button_catalog.get(target_key, target_key))
+    await callback.message.edit_text(
+        f"Tugma: <b>{label}</b>\nPack'dan emoji tanlang:",
+        reply_markup=get_button_emoji_pack_keyboard(0, target_page)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_pack_page:"))
+async def cb_button_emoji_pack_page(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Sahifa noto'g'ri.", show_alert=True)
+        return
+    data = await state.get_data()
+    await callback.message.edit_reply_markup(
+        reply_markup=get_button_emoji_pack_keyboard(
+            page, int(data.get("button_emoji_target_page", 0))
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_pick:"))
+async def cb_button_emoji_pick(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    data = await state.get_data()
+    target_key = data.get("button_emoji_target")
+    try:
+        index = int(callback.data.rsplit(":", 1)[1])
+        document_id, alt = _custom_emoji_pack_cache[index]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Emoji ro'yxati eskirgan. Qaytadan oching.", show_alert=True)
+        return
+    if not target_key or target_key not in _button_catalog:
+        await callback.answer("❌ Tugma tanlovi eskirgan. Qaytadan oching.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"button_emoji:{target_key}", str(document_id))
+        )
+        await db.commit()
+    _button_custom_emoji_ids[target_key] = str(document_id)
+    label = html.escape(_button_catalog[target_key])
+    target_page = int(data.get("button_emoji_target_page", 0))
+    await callback.message.edit_text(
+        f"✅ {html.escape(alt)} custom emoji <b>{label}</b> tugmasiga o'rnatildi.",
+        reply_markup=get_button_emoji_targets_keyboard(target_page)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "button_emoji_clear")
+async def cb_button_emoji_clear(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+        return
+    data = await state.get_data()
+    target_key = data.get("button_emoji_target")
+    if not target_key:
+        await callback.answer("❌ Tugma tanlanmagan.", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM bot_settings WHERE key = ?", (f"button_emoji:{target_key}",))
+        await db.commit()
+    _button_custom_emoji_ids.pop(target_key, None)
+    target_page = int(data.get("button_emoji_target_page", 0))
+    await callback.message.edit_text(
+        "✅ Tugma custom emoji'si olib tashlandi.",
+        reply_markup=get_button_emoji_targets_keyboard(target_page)
+    )
+    await callback.answer()
 
 # — Kanallar boshqaruvi —
 @dp.callback_query(F.data == "admin_channels")
@@ -2062,14 +3130,55 @@ async def load_existing_sessions():
         except Exception as e:
             log.error(f"Sessiya yuklashda xato ({uid}): {e}")
 
+
+async def health_server():
+    """Render health checks uchun kichik HTTP endpoint."""
+    async def handle_health(reader, writer):
+        try:
+            await reader.read(1024)
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Content-Length: 2\r\n"
+                "Connection: close\r\n\r\n"
+                "OK"
+            )
+            writer.write(response.encode())
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    port = int(os.getenv("PORT", "10000"))
+    server = await asyncio.start_server(handle_health, "0.0.0.0", port)
+    async with server:
+        await server.serve_forever()
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
+def register_common_keyboard_buttons():
+    get_main_keyboard(has_pro=True)
+    get_admin_keyboard()
+    get_admin_channels_keyboard([])
+    get_userbot_keyboard(None)
+    get_settings_keyboard()
+    get_utag_speed_keyboard(1.5)
+    get_login_code_keyboard()
+    get_auto_reply_keyboard(False)
+    get_scrape_groups_keyboard("")
+    get_scrape_count_keyboard()
+    get_scrape_mode_keyboard()
+    back_kb()
+
+
 async def main():
     await init_db()
     await load_existing_sessions()
+    register_common_keyboard_buttons()
     asyncio.create_task(pro_expiration_checker())
     asyncio.create_task(bio_watcher())
+    asyncio.create_task(health_server())
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":

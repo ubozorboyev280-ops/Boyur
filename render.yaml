@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pro-utaggerbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python "pro_utaggerbot (2).py"
+    healthCheckPath: /
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: CUSTOM_EMOJI_PACK
+        sync: false
