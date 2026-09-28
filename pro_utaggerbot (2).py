@@ -70,7 +70,7 @@ API_ID    = required_int_env(
 if not 1 <= API_ID <= 2_147_483_647:
     raise RuntimeError("API_ID must be the valid app ID from my.telegram.org, not a Telegram user ID")
 API_HASH  = required_env("API_HASH")
-BOT_TOKEN = required_env("BOT_TOKEN")
+BOT_TOKEN = required_env("BOT_TOKEN").strip()
 ADMIN_ID  = required_int_env("ADMIN_ID", "Set the numeric Telegram user ID.")
 if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID must be a positive Telegram user ID")
@@ -1689,6 +1689,22 @@ async def text_phone_input(message: Message, state: FSMContext):
         phone = "+" + phone
     await process_phone_login(message, state, phone)
 
+def get_login_code_delivery_hint(sent) -> str:
+    delivery_type = type(getattr(sent, "type", None)).__name__
+    hints = {
+        "SentCodeTypeApp": "Telegram ilovasidagi rasmiy Telegram chatini tekshiring.",
+        "SentCodeTypeSms": "Telefoningizga kelgan SMS xabarlarni tekshiring.",
+        "SentCodeTypeCall": "Telegram sizga qo'ng'iroq qiladi; qo'ng'iroqni kuting.",
+        "SentCodeTypeFlashCall": "Telegramdan kelgan o'tkazib yuborilgan qo'ng'iroqni tekshiring.",
+        "SentCodeTypeMissedCall": "Telegramdan kelgan o'tkazib yuborilgan qo'ng'iroqni tekshiring.",
+        "SentCodeTypeEmailCode": "Telegram akkauntingizga bog'langan emailni tekshiring.",
+        "SentCodeTypeFragmentSms": "Fragment orqali keladigan SMS xabarni tekshiring.",
+    }
+    return hints.get(
+        delivery_type,
+        "Telegram ko'rsatgan usulni tekshiring; kod SMS bo'lishi shart emas."
+    )
+
 async def process_phone_login(message: Message, state: FSMContext, phone: str):
     digits = re.sub(r"\D", "", phone)
     if not 7 <= len(digits) <= 15:
@@ -1700,13 +1716,15 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
     try:
         await client.connect()
         sent = await client.send_code_request(phone)
+        delivery_hint = get_login_code_delivery_hint(sent)
         await state.update_data(
             temp_client=client, phone=phone,
-            phone_code_hash=sent.phone_code_hash, login_code=""
+            phone_code_hash=sent.phone_code_hash, login_code="",
+            code_delivery_hint=delivery_hint
         )
         await state.set_state(UserStatesGroup.login_code)
         prompt = await message.answer(
-            login_code_prompt("") + "\n\nKod Telegram ilovasidagi rasmiy xizmat xabariga kelishi mumkin.",
+            login_code_prompt("", delivery_hint),
             reply_markup=get_login_code_keyboard()
         )
         await state.update_data(
@@ -1747,7 +1765,9 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
                 "Telegram kod so'rovini bajarmadi. Render loglaridagi "
                 "'Telegram login kodi so'ralmadi' xatosini tekshiring."
             )
-        await message.answer(f"❌ {error_text}")
+        await message.answer(
+            f"❌ {error_text}\nXato turi: <code>{type(exc).__name__}</code>"
+        )
 
 @dp.message(StateFilter(UserStatesGroup.login_code), F.text)
 async def code_input(message: Message, state: FSMContext):
@@ -1821,7 +1841,7 @@ async def refresh_login_code_prompt(
     message_id = data.get("login_code_prompt_message_id")
     if not chat_id or not message_id:
         return
-    text = login_code_prompt(code)
+    text = login_code_prompt(code, data.get("code_delivery_hint"))
     if error:
         text = f"❌ {html.escape(error)}\n\n{text}"
     await bot.edit_message_text(
@@ -1832,15 +1852,17 @@ async def refresh_login_code_prompt(
     )
 
 
-def login_code_prompt(code: str) -> str:
+def login_code_prompt(code: str, delivery_hint: str | None = None) -> str:
     masked_code = "●" * len(code) or "—"
-    return (
+    text = (
         "📩 <b>Telegram tasdiqlash kodi</b>\n\n"
-        "Kod shu botga emas, Telegram akkauntingiz ochiq turgan ilovadagi rasmiy "
-        "Telegram chatiga yoki Telegram tanlagan boshqa usulga yuboriladi.\n"
+        "Tasdiqlash kodi shu botga yuborilmaydi.\n"
         "Kodni matn qilib yuboring yoki quyidagi raqamli klaviaturadan kiriting.\n"
         f"Kiritildi: <code>{masked_code}</code>"
     )
+    if delivery_hint:
+        text += f"\n\n📍 {delivery_hint}"
+    return text
 
 
 def get_login_code_keyboard() -> InlineKeyboardMarkup:
@@ -1855,6 +1877,10 @@ def get_login_code_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="0", callback_data="login_code:digit:0"),
         InlineKeyboardButton(text="🧹", callback_data="login_code:clear"),
     )
+    kb.row(InlineKeyboardButton(
+        text="🔄 Kod kelmadi — qayta so'rash",
+        callback_data="login_code:resend"
+    ))
     kb.row(InlineKeyboardButton(text="✅ Kodni tekshirish", callback_data="login_code:submit"))
     kb.row(InlineKeyboardButton(text="✖️ Bekor qilish", callback_data="login_code:cancel"))
     return kb.as_markup()
@@ -1878,6 +1904,41 @@ async def login_code_keypad_input(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    if action == "resend":
+        client = data.get("temp_client")
+        phone = data.get("phone")
+        if not client or not phone:
+            await callback.answer("Login sessiyasi tugagan. Qaytadan boshlang.", show_alert=True)
+            return
+        try:
+            sent = await client.send_code_request(phone)
+            delivery_hint = get_login_code_delivery_hint(sent)
+            resend_count = int(data.get("resend_count", 0)) + 1
+            await state.update_data(
+                phone_code_hash=sent.phone_code_hash or data.get("phone_code_hash"),
+                login_code="",
+                code_delivery_hint=delivery_hint,
+                resend_count=resend_count
+            )
+            await callback.message.edit_text(
+                login_code_prompt("", delivery_hint)
+                + f"\n\n🔄 Qayta so'raldi: {resend_count}",
+                reply_markup=get_login_code_keyboard()
+            )
+            await callback.answer("Yangi kod so'raldi.")
+        except FloodWaitError as exc:
+            await callback.answer(
+                f"Telegram qayta urinishdan oldin {exc.seconds} soniya kutishni so'radi.",
+                show_alert=True
+            )
+        except Exception as exc:
+            log.exception("Telegram login kodi qayta so'ralmadi")
+            await callback.answer(
+                f"Kod qayta so'ralmadi ({type(exc).__name__}). Keyinroq urinib ko'ring.",
+                show_alert=True
+            )
+        return
+
     if action.startswith("digit:"):
         digit = action.split(":", 1)[1]
         if digit in "0123456789" and len(code) < 10:
@@ -1895,8 +1956,10 @@ async def login_code_keypad_input(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(two_fa_prompt(), reply_markup=None)
         elif status == "retry":
             await state.update_data(login_code="")
+            retry_error = html.escape(error or "Kod noto'g'ri.")
             await callback.message.edit_text(
-                f"❌ {html.escape(error or 'Kod noto\'g\'ri.')}\n\n{login_code_prompt('')}",
+                f"❌ {retry_error}\n\n"
+                f"{login_code_prompt('', data.get('code_delivery_hint'))}",
                 reply_markup=get_login_code_keyboard(),
             )
         elif status == "expired":
