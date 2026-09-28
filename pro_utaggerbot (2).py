@@ -76,9 +76,10 @@ if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID must be a positive Telegram user ID")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@owapro")
 IS_RENDER_SERVICE = bool(os.getenv("RENDER_SERVICE_ID"))
-DB_FILE = os.getenv(
-    "DB_FILE",
-    os.path.join("/tmp", "database22.db") if IS_RENDER_SERVICE else "database22.db",
+DB_FILE = (
+    os.path.join("/tmp", "database22.db")
+    if IS_RENDER_SERVICE
+    else os.getenv("DB_FILE", "database22.db")
 )
 CLONE_TOKEN_ENCRYPTION_KEY = os.getenv("CLONE_TOKEN_ENCRYPTION_KEY", "").strip()
 CUSTOM_EMOJI_PACK = os.getenv("CUSTOM_EMOJI_PACK", "").strip()
@@ -207,6 +208,7 @@ class UserStatesGroup(StatesGroup):
 # ─────────────────────────────────────────────
 async def init_db():
     global CUSTOM_EMOJI_PACK
+    os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (

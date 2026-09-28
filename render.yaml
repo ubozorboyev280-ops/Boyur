@@ -19,7 +19,5 @@ services:
         sync: false
       - key: CUSTOM_EMOJI_PACK
         sync: false
-      - key: DB_FILE
-        value: /tmp/database22.db
       - key: CLONE_TOKEN_ENCRYPTION_KEY
         sync: false
