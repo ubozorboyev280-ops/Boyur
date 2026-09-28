@@ -893,7 +893,7 @@ def get_main_keyboard(
     )
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🤖 O'z botimni yaratish", callback_data="clone_buy"))
-    if show_raid_panel and has_raid_access:
+    if not is_clone_bot() and show_raid_panel and has_raid_access:
         kb.row(InlineKeyboardButton(text="🚫 Ban panel", callback_data="ban_panel"))
     return kb.as_markup()
 
@@ -1079,16 +1079,17 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     uid = str(message.from_user.id)
 
-    subscribed, channel = await check_subscriptions(message.from_user.id)
-    if subscribed is None:
-        await message.answer(subscription_error_message(channel, check_failed=True))
-        return
-    if not subscribed:
-        await message.answer(
-            subscription_error_message(channel, check_failed=False),
-            reply_markup=await get_sub_keyboard()
-        )
-        return
+    if not is_clone_bot():
+        subscribed, channel = await check_subscriptions(message.from_user.id)
+        if subscribed is None:
+            await message.answer(subscription_error_message(channel, check_failed=True))
+            return
+        if not subscribed:
+            await message.answer(
+                subscription_error_message(channel, check_failed=False),
+                reply_markup=await get_sub_keyboard()
+            )
+            return
 
     args = message.text.split()
     referrer_id = args[1] if len(args) > 1 and args[1] != uid else None
@@ -1156,34 +1157,37 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "check_subscription")
 async def cb_check_sub(callback: CallbackQuery, state: FSMContext):
-    subscribed, channel = await check_subscriptions(callback.from_user.id)
-    if subscribed is True:
-        await callback.answer("✅ Rahmat! Obuna tasdiqlandi.", show_alert=True)
-        await callback.message.delete()
-        await callback.message.answer(
-            get_start_message(callback.from_user.first_name or "", callback.from_user.id),
-            reply_markup=await get_user_main_keyboard(callback.from_user.id)
-        )
-    elif subscribed is None:
-        await callback.answer(
-            f"Kanalni tekshirib bo'lmadi: {channel}. Botni kanalga admin qiling.",
-            show_alert=True
-        )
-    else:
-        await callback.answer(f"Hali {channel} kanaliga a'zo emassiz.", show_alert=True)
+    if not is_clone_bot():
+        subscribed, channel = await check_subscriptions(callback.from_user.id)
+        if subscribed is None:
+            await callback.answer(
+                f"Kanalni tekshirib bo'lmadi: {channel}. Botni kanalga admin qiling.",
+                show_alert=True
+            )
+            return
+        if not subscribed:
+            await callback.answer(f"Hali {channel} kanaliga a'zo emassiz.", show_alert=True)
+            return
+    await callback.answer("✅ Botga xush kelibsiz." if is_clone_bot() else "✅ Rahmat! Obuna tasdiqlandi.", show_alert=True)
+    await callback.message.delete()
+    await callback.message.answer(
+        get_start_message(callback.from_user.first_name or "", callback.from_user.id),
+        reply_markup=await get_user_main_keyboard(callback.from_user.id)
+    )
 
 # ─────────────────────────────────────────────
 # MAIN MENU callback
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
-    subscribed, channel = await check_subscriptions(callback.from_user.id)
-    if subscribed is not True:
-        await callback.message.edit_text(
-            subscription_error_message(channel, check_failed=subscribed is None),
-            reply_markup=await get_sub_keyboard()
-        )
-        return
+    if not is_clone_bot():
+        subscribed, channel = await check_subscriptions(callback.from_user.id)
+        if subscribed is not True:
+            await callback.message.edit_text(
+                subscription_error_message(channel, check_failed=subscribed is None),
+                reply_markup=await get_sub_keyboard()
+            )
+            return
     await state.clear()
     await callback.message.edit_text(
         get_start_message(callback.from_user.first_name or "", callback.from_user.id),
@@ -1193,6 +1197,9 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.in_({"raid_panel", "ban_panel"}))
 async def cb_raid_panel(callback: CallbackQuery, state: FSMContext):
+    if is_clone_bot():
+        await callback.answer("Raid clone botda mavjud emas.", show_alert=True)
+        return
     uid = str(callback.from_user.id)
     if not await user_has_raid_access(uid):
         await callback.message.edit_reply_markup(
@@ -1458,6 +1465,9 @@ async def pre_checkout_clone(query: types.PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def clone_payment_success(message: Message, state: FSMContext):
+    if is_clone_bot():
+        await message.answer("Klon bot sotib olish faqat asosiy botda mumkin.")
+        return
     payment = message.successful_payment
     if payment.currency != "XTR":
         await message.answer("To'lovni tekshirib bo'lmadi. Bot egasiga murojaat qiling.")
@@ -1487,6 +1497,9 @@ async def clone_payment_success(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "clone_continue")
 async def cb_clone_continue(callback: CallbackQuery, state: FSMContext):
+    if is_clone_bot():
+        await callback.answer("Klon sozlash faqat asosiy botda mumkin.", show_alert=True)
+        return
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT id FROM clone_orders WHERE user_id = ? AND status = 'paid' "
@@ -1505,6 +1518,9 @@ async def cb_clone_continue(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(UserStatesGroup.clone_token_input), F.text)
 async def clone_token_input(message: Message, state: FSMContext):
+    if is_clone_bot():
+        await message.answer("Klon bot qo'shish faqat asosiy botda mumkin.")
+        return
     token = message.text.strip()
     order_id = (await state.get_data()).get("clone_order_id")
     if not order_id:
@@ -2722,10 +2738,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="🏆 Aktiv konkurslar", callback_data="admin_contests_list"))
     kb.row(InlineKeyboardButton(text="📣 Xabar tarqatish", callback_data="admin_broadcast"))
     kb.row(InlineKeyboardButton(text="😀 Custom emoji pack", callback_data="admin_custom_emoji"))
-    if is_clone_bot():
-        kb.row(InlineKeyboardButton(text="🚫 Ban panel", callback_data="ban_panel"))
-        kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
-    else:
+    if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🚫 Ban panel", callback_data="ban_panel"))
         kb.row(InlineKeyboardButton(text="🛡 Raid guruhlarini tanlash", callback_data="admin_raid_groups"))
         kb.row(InlineKeyboardButton(text="👤 Raid userlariga ruxsat", callback_data="admin_raid_users"))
@@ -4685,6 +4698,18 @@ async def poll_clone_updates(clone_bot: Bot, bot_id: int, owner_id: int, usernam
             )
             for update in updates:
                 offset = update.update_id + 1
+                callback_query = update.callback_query
+                callback_data = callback_query.data or "" if callback_query else ""
+                if callback_query and (
+                    callback_data == "ban_panel"
+                    or callback_data.startswith(("raid_", "admin_raid_"))
+                ):
+                    await clone_bot.answer_callback_query(
+                        callback_query.id,
+                        text="Raid clone botda mavjud emas.",
+                        show_alert=True,
+                    )
+                    continue
                 bot_token = _active_bot.set(clone_bot)
                 owner_token = _active_clone_owner.set(owner_id)
                 username_token = _active_bot_username.set(username)
