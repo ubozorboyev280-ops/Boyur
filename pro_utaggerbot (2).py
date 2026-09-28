@@ -1424,19 +1424,20 @@ async def cb_clone_buy(callback: CallbackQuery, state: FSMContext):
     price = await get_clone_price()
     order_id = os.urandom(12).hex()
     payload = f"clone:{callback.from_user.id}:{order_id}"
+    status = "paid" if price == 0 else "pending"
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO clone_orders (id, user_id, payload, amount, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, str(callback.from_user.id), payload, price,
-             "paid" if price == 0 else "pending", datetime.now(timezone.utc).isoformat())
+            (order_id, str(callback.from_user.id), payload, price, status,
+             datetime.now(timezone.utc).isoformat())
         )
         await db.commit()
     if price == 0:
         await state.update_data(clone_order_id=order_id)
         await state.set_state(UserStatesGroup.clone_token_input)
         await callback.message.answer(
-            "Klon narxi 0 Stars. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
+            "Klon bepul. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
             "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi."
         )
         await callback.answer()
@@ -1727,10 +1728,25 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
             await client.disconnect()
         except Exception:
             pass
-        await message.answer(
-            "❌ Kod yuborilmadi. API_ID va API_HASH qiymatlarini tekshiring, "
-            "so'ng telefon raqamini qayta kiriting."
-        )
+        error_name = type(exc).__name__
+        if error_name == "ApiIdInvalidError":
+            error_text = "API_ID yoki API_HASH noto'g'ri. my.telegram.org dagi qiymatlarni tekshiring."
+        elif error_name == "ApiIdPublishedFloodError":
+            error_text = "API_ID Telegram tomonidan cheklangan. O'zingizning my.telegram.org API_ID/API_HASH juftligingizni kiriting."
+        elif error_name == "PhoneNumberInvalidError":
+            error_text = "Telefon raqami noto'g'ri. Raqamni + bilan xalqaro formatda kiriting."
+        elif error_name == "PhoneNumberBannedError":
+            error_text = "Bu telefon raqamiga Telegram orqali kirish cheklangan."
+        elif error_name in {"PhoneNumberFloodError", "FloodWaitError"}:
+            wait_seconds = getattr(exc, "seconds", None)
+            wait_text = f" Taxminan {wait_seconds} soniyadan keyin urinib ko'ring." if wait_seconds else " Keyinroq urinib ko'ring."
+            error_text = "Telegram juda ko'p urinishni qayd qildi." + wait_text
+        else:
+            error_text = (
+                "Telegram kod so'rovini bajarmadi. Render loglaridagi "
+                "'Telegram login kodi so'ralmadi' xatosini tekshiring."
+            )
+        await message.answer(f"❌ {error_text}")
 
 @dp.message(StateFilter(UserStatesGroup.login_code), F.text)
 async def code_input(message: Message, state: FSMContext):
@@ -1819,6 +1835,8 @@ def login_code_prompt(code: str) -> str:
     masked_code = "●" * len(code) or "—"
     return (
         "📩 <b>Telegram tasdiqlash kodi</b>\n\n"
+        "Kod shu botga emas, Telegram akkauntingiz ochiq turgan ilovadagi rasmiy "
+        "Telegram chatiga yoki Telegram tanlagan boshqa usulga yuboriladi.\n"
         "Kodni matn qilib yuboring yoki quyidagi raqamli klaviaturadan kiriting.\n"
         f"Kiritildi: <code>{masked_code}</code>"
     )
@@ -2940,7 +2958,7 @@ async def cb_admin_clone_price(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     await callback.message.edit_text(
-        "Klonning yangi narxini Telegram Stars'da yuboring (0 dan 100000 gacha butun son):",
+        "Klonning yangi narxini Telegram Stars'da yuboring (0 dan 100000 gacha butun son; 0 bepul):",
         reply_markup=back_kb("admin_clone_settings")
     )
     await state.set_state(UserStatesGroup.admin_clone_price)
@@ -3059,7 +3077,7 @@ async def admin_custom_emoji_pack_input(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_raid_groups")
 async def cb_admin_raid_groups(callback: CallbackQuery):
-    if not is_panel_owner(callback.from_user.id):
+    if is_clone_bot() or not is_panel_owner(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     async with aiosqlite.connect(DB_FILE) as db:
