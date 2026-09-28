@@ -1408,13 +1408,13 @@ async def get_clone_price() -> int:
         ) as cur:
             row = await cur.fetchone()
     try:
-        return max(1, int(row[0])) if row else 100
+        return max(0, int(row[0])) if row else 100
     except (TypeError, ValueError):
         return 100
 
 
 @dp.callback_query(F.data == "clone_buy")
-async def cb_clone_buy(callback: CallbackQuery):
+async def cb_clone_buy(callback: CallbackQuery, state: FSMContext):
     if is_clone_bot():
         await callback.answer("Klon sotib olish faqat asosiy bot orqali mumkin.", show_alert=True)
         return
@@ -1427,10 +1427,20 @@ async def cb_clone_buy(callback: CallbackQuery):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "INSERT INTO clone_orders (id, user_id, payload, amount, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?)",
-            (order_id, str(callback.from_user.id), payload, price, datetime.now(timezone.utc).isoformat())
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (order_id, str(callback.from_user.id), payload, price,
+             "paid" if price == 0 else "pending", datetime.now(timezone.utc).isoformat())
         )
         await db.commit()
+    if price == 0:
+        await state.update_data(clone_order_id=order_id)
+        await state.set_state(UserStatesGroup.clone_token_input)
+        await callback.message.answer(
+            "Klon narxi 0 Stars. @BotFather orqali bot yarating va uning tokenini shu yerga yuboring. "
+            "Token shifrlangan holda saqlanadi va qayta ko'rsatilmaydi."
+        )
+        await callback.answer()
+        return
     await callback.message.answer_invoice(
         title="Shaxsiy Telegram bot",
         description="Bot nusxangizni umumiy tizimga ulash.",
@@ -2930,7 +2940,7 @@ async def cb_admin_clone_price(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     await callback.message.edit_text(
-        "Klonning yangi narxini Telegram Stars'da yuboring (1 dan 100000 gacha butun son):",
+        "Klonning yangi narxini Telegram Stars'da yuboring (0 dan 100000 gacha butun son):",
         reply_markup=back_kb("admin_clone_settings")
     )
     await state.set_state(UserStatesGroup.admin_clone_price)
@@ -2943,10 +2953,10 @@ async def admin_clone_price_input(message: Message, state: FSMContext):
     try:
         price = int(message.text.strip())
     except ValueError:
-        await message.answer("1 dan 100000 gacha butun Stars sonini kiriting.")
+        await message.answer("0 dan 100000 gacha butun Stars sonini kiriting.")
         return
-    if not 1 <= price <= 100000:
-        await message.answer("Narx 1 dan 100000 Stars oralig'ida bo'lishi kerak.")
+    if not 0 <= price <= 100000:
+        await message.answer("Narx 0 dan 100000 Stars oralig'ida bo'lishi kerak.")
         return
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
