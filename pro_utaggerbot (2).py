@@ -4838,17 +4838,20 @@ def register_common_keyboard_buttons():
 
 
 async def main():
-    await init_db()
-    asyncio.create_task(health_server())
-    await load_existing_sessions()
-    register_common_keyboard_buttons()
-    await load_registered_clones()
-    asyncio.create_task(pro_expiration_checker())
-    asyncio.create_task(bio_watcher())
     try:
+        await init_db()
+        asyncio.create_task(health_server())
+        await load_existing_sessions()
+        register_common_keyboard_buttons()
+        await load_registered_clones()
+        asyncio.create_task(pro_expiration_checker())
+        asyncio.create_task(bio_watcher())
         await dp.start_polling(primary_bot, skip_updates=True)
     finally:
-        await stop_registered_clones()
+        try:
+            await stop_registered_clones()
+        finally:
+            await primary_bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
