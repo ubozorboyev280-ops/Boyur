@@ -2,13 +2,17 @@ services:
   - type: web
     name: pro-utaggerbot
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python "pro_utaggerbot (2).py"
     healthCheckPath: /
+    disk:
+      name: pro-utaggerbot-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: API_ID
-        sync: false
+        value: "38640395"
       - key: API_HASH
         sync: false
       - key: BOT_TOKEN
@@ -18,4 +22,8 @@ services:
       - key: ADMIN_USERNAME
         sync: false
       - key: CUSTOM_EMOJI_PACK
+        sync: false
+      - key: DB_FILE
+        value: /var/data/database22.db
+      - key: CLONE_TOKEN_ENCRYPTION_KEY
         sync: false
