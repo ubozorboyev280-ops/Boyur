@@ -129,6 +129,8 @@ _group_random_words_cache: dict[int, tuple[datetime, list[str]]] = {}
 _button_custom_emoji_ids: dict[str, str] = {}
 _button_catalog: dict[str, str] = {}
 _button_emoji_target_keys: list[str] = []
+_button_styles = ("success", "primary", "danger")
+_button_style_index = 0
 bot_username = ""
 clone_bots: dict[int, Bot] = {}
 clone_polling_tasks: dict[int, asyncio.Task] = {}
@@ -154,7 +156,10 @@ def clone_token_cipher() -> Fernet:
 
 
 def _build_emoji_button(button_type, text: str, kwargs: dict):
-    kwargs.setdefault("style", "success")
+    global _button_style_index
+    if "style" not in kwargs:
+        kwargs["style"] = _button_styles[_button_style_index % len(_button_styles)]
+        _button_style_index += 1
     key = str(kwargs.get("callback_data") or kwargs.get("url") or text)
     if key and not key.startswith(("button_emoji_", "admin_custom_emoji", "admin_button_emoji")):
         _button_catalog[key] = text

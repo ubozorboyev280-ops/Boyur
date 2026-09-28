@@ -3,6 +3,7 @@ services:
     name: pro-utaggerbot
     runtime: python
     plan: starter
+    numInstances: 1
     buildCommand: pip install -r requirements.txt
     startCommand: python "pro_utaggerbot (2).py"
     healthCheckPath: /
