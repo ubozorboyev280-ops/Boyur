@@ -77,7 +77,7 @@ if ADMIN_ID <= 0:
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@owapro")
 IS_RENDER_SERVICE = bool(os.getenv("RENDER_SERVICE_ID"))
 DB_FILE = (
-    os.path.join("/tmp", "database22.db")
+    os.getenv("DB_FILE", os.path.join("/var/data", "database22.db"))
     if IS_RENDER_SERVICE
     else os.getenv("DB_FILE", "database22.db")
 )
@@ -1683,11 +1683,22 @@ async def process_phone_login(message: Message, state: FSMContext, phone: str):
         )
         await state.set_state(UserStatesGroup.login_code)
         prompt = await message.answer(
-            login_code_prompt(""), reply_markup=get_login_code_keyboard()
+            login_code_prompt("") + "\n\nKod Telegram ilovasidagi rasmiy xizmat xabariga kelishi mumkin.",
+            reply_markup=get_login_code_keyboard()
         )
         await state.update_data(
             login_code_prompt_chat_id=prompt.chat.id,
             login_code_prompt_message_id=prompt.message_id,
+        )
+    except FloodWaitError as exc:
+        log.warning("Telegram login kodi uchun kutish talab qilindi: %s soniya", exc.seconds)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await message.answer(
+            f"⏳ Telegram yangi kod yuborishdan oldin {exc.seconds} soniya kutishni so'radi. "
+            "Keyin telefon raqamini qayta yuboring."
         )
     except Exception as exc:
         log.exception("Telegram login kodi so'ralmadi")
@@ -2765,10 +2776,11 @@ def get_admin_raid_groups_keyboard(groups: list[dict]) -> InlineKeyboardMarkup:
             text=f"🗑 {group['title'][:40]}",
             callback_data=f"admin_raid_del:{group['chat_id']}"
         ))
-    kb.row(InlineKeyboardButton(
-        text="➕ Ban huquqi bor guruh qo'shish",
-        callback_data="admin_raid_add_group"
-    ))
+    if not is_clone_bot():
+        kb.row(InlineKeyboardButton(
+            text="➕ Ban huquqi bor guruh qo'shish",
+            callback_data="admin_raid_add_group"
+        ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel"))
     return kb.as_markup()
 
@@ -3053,18 +3065,20 @@ async def cb_admin_raid_groups(callback: CallbackQuery):
         "🛡 <b>Raid profillari va guruhlari</b>\n\n"
         f"{listing}\n\n"
         "User ID yoki username yuboring. Bot o‘sha profilning admin va ban huquqi bor guruhlarini chiqaradi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="➕ Profil guruhlarini topish", callback_data="admin_raid_add_group")
-        ], [
-            InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel")
-        ]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=(
+            ([] if is_clone_bot() else [[
+                InlineKeyboardButton(text="➕ Profil guruhlarini topish", callback_data="admin_raid_add_group")
+            ]]) + [[
+                InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_panel")
+            ]]
+        ))
     )
     await callback.answer()
 
 
 @dp.callback_query(F.data == "admin_raid_add_group")
 async def cb_admin_raid_add_group(callback: CallbackQuery, state: FSMContext):
-    if not is_panel_owner(callback.from_user.id):
+    if is_clone_bot() or not is_panel_owner(callback.from_user.id):
         await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
         return
     await callback.message.edit_text(
