@@ -4,10 +4,6 @@ services:
     runtime: python
     plan: starter
     numInstances: 1
-    disk:
-      name: pro-utaggerbot-data
-      mountPath: /var/data
-      sizeGB: 1
     buildCommand: pip install -r requirements.txt
     startCommand: python "pro_utaggerbot (2).py"
     healthCheckPath: /

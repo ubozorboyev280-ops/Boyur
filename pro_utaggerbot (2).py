@@ -75,12 +75,7 @@ ADMIN_ID  = required_int_env("ADMIN_ID", "Set the numeric Telegram user ID.")
 if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID must be a positive Telegram user ID")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@owapro")
-IS_RENDER_SERVICE = bool(os.getenv("RENDER_SERVICE_ID"))
-DB_FILE = (
-    os.getenv("DB_FILE", os.path.join("/var/data", "database22.db"))
-    if IS_RENDER_SERVICE
-    else os.getenv("DB_FILE", "database22.db")
-)
+DB_FILE = os.getenv("DB_FILE", "database22.db")
 CLONE_TOKEN_ENCRYPTION_KEY = os.getenv("CLONE_TOKEN_ENCRYPTION_KEY", "").strip()
 CUSTOM_EMOJI_PACK = os.getenv("CUSTOM_EMOJI_PACK", "").strip()
 
