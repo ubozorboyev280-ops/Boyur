@@ -6,10 +6,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python "pro_utaggerbot (2).py"
     healthCheckPath: /
-    disk:
-      name: pro-utaggerbot-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: API_ID
         value: "38640395"
@@ -24,6 +20,6 @@ services:
       - key: CUSTOM_EMOJI_PACK
         sync: false
       - key: DB_FILE
-        value: /var/data/database22.db
+        value: /tmp/database22.db
       - key: CLONE_TOKEN_ENCRYPTION_KEY
         sync: false
