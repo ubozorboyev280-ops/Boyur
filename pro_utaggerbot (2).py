@@ -79,10 +79,12 @@ IS_RENDER_SERVICE = bool(os.getenv("RENDER_SERVICE_ID"))
 DB_FILE = "database22.db" if IS_RENDER_SERVICE else os.getenv("DB_FILE", "database22.db")
 CLONE_TOKEN_ENCRYPTION_KEY = os.getenv("CLONE_TOKEN_ENCRYPTION_KEY", "").strip()
 CUSTOM_EMOJI_PACK = os.getenv("CUSTOM_EMOJI_PACK", "").strip()
+FREE_MODE = os.getenv("FREE_MODE", "1").strip().lower() not in {"0", "false", "no"}
 
 AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
 BIO_AD_TEXT = "🤖 Powered by @Prime_utaggerbot 🚀"
 AUTO_REPLY_AD = f"{AD_TEXT}\n🤖 Avto javob qilindi."
+DEFAULT_AUTO_REPLY_TEXT = "Assalomu alaykum! Hozirda bandman, bo'shashim bilan sizga javob beraman."
 SOURCE_FILE = os.getenv("SOURCE_FILE", __file__)
 
 
@@ -253,8 +255,16 @@ async def init_db():
             owner_id      TEXT PRIMARY KEY,
             enabled       INTEGER DEFAULT 0,
             response_text TEXT NOT NULL,
+            cooldown_seconds INTEGER NOT NULL DEFAULT 14400,
             updated_at    TEXT
         )""")
+        try:
+            await db.execute(
+                "ALTER TABLE auto_reply_settings ADD COLUMN cooldown_seconds "
+                "INTEGER NOT NULL DEFAULT 14400"
+            )
+        except Exception:
+            pass
         await db.execute("""
         CREATE TABLE IF NOT EXISTS utag_settings (
             owner_id TEXT PRIMARY KEY,
@@ -545,6 +555,8 @@ def subscription_error_message(channel: str | None, check_failed: bool) -> str:
 # PRO HELPERS
 # ─────────────────────────────────────────────
 def is_pro_user(pro_until_str: str | None) -> bool:
+    if FREE_MODE:
+        return True
     if not pro_until_str:
         return False
     try:
@@ -890,7 +902,16 @@ def get_main_keyboard(
     )
     kb.row(
         InlineKeyboardButton(text="💠 User Yig'ish", callback_data="btn_scrape"),
-        InlineKeyboardButton(text="⭐ Pro Tarif & Referal", callback_data="btn_pro_info")
+        InlineKeyboardButton(text="🆓 Bepul rejim", callback_data="btn_pro_info")
+    )
+    kb.row(
+        InlineKeyboardButton(text="👤 Profil", callback_data="profile"),
+        InlineKeyboardButton(text="📱 Akauntlar", callback_data="btn_userbot")
+    )
+    kb.row(
+        InlineKeyboardButton(text="📖 Yordam", callback_data="help"),
+        InlineKeyboardButton(text="📜 Qoidalar", callback_data="rules"),
+        InlineKeyboardButton(text="💰 Tariflar", callback_data="prices")
     )
     if not is_clone_bot():
         kb.row(InlineKeyboardButton(text="🤖 O'z botimni yaratish", callback_data="clone_buy"))
@@ -939,6 +960,8 @@ async def get_raid_settings(user_id: int | str) -> tuple[float, int]:
 
 
 async def get_user_main_keyboard(user_id: int | str) -> InlineKeyboardMarkup:
+    if str(user_id) not in userbot_clients:
+        return get_userbot_keyboard(None)
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT pro_until, raid_enabled FROM users WHERE id = ?",
@@ -977,7 +1000,10 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📖 uTag qanday ishlaydi?", callback_data="settings_how_utag"))
     kb.row(InlineKeyboardButton(text="⚡ uTag tezligini sozlash", callback_data="settings_utag_speed"))
-    kb.row(InlineKeyboardButton(text="💳 Reklama sotib olish (PRO)", callback_data="settings_buy_pro"))
+    kb.row(InlineKeyboardButton(
+        text="🆓 Bepul tarif" if FREE_MODE else "💳 Reklama sotib olish (PRO)",
+        callback_data="settings_buy_pro"
+    ))
     kb.row(InlineKeyboardButton(text="📢 Kanal havolam", callback_data="settings_my_ref"))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
     return kb.as_markup()
@@ -1002,6 +1028,9 @@ def get_utag_speed_keyboard(delay: float) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────────
 async def pro_expiration_checker():
     while True:
+        if FREE_MODE:
+            await asyncio.sleep(3600)
+            continue
         try:
             now = datetime.now(timezone.utc)
             async with aiosqlite.connect(DB_FILE) as db:
@@ -1065,8 +1094,15 @@ async def pro_expiration_checker():
 # START & REFERRAL
 # ─────────────────────────────────────────────
 def get_start_message(first_name: str, user_id: int) -> str:
+    safe_name = html.escape(first_name)
+    if str(user_id) not in userbot_clients:
+        return (
+            f"💠 Assalom alaykum, <b>{safe_name}</b>!\n\n"
+            "Bot funksiyalarini ochish uchun avval Telegram akkauntingizni ulang.\n"
+            "📱 Pastdagi <b>Akkaunt ulash</b> tugmasini bosing."
+        )
     text = (
-        f"💠 Assalom alaykum, <b>{html.escape(first_name)}</b>!\n\n"
+        f"💠 Assalom alaykum, <b>{safe_name}</b>!\n\n"
         "Ushbu bot orqali o'z Telegram profilingizni ulab, guruhlarda xavfsiz "
         "<b>uTag</b> qilishingiz, <b>avto xabar</b> yuborish va <b>user yig'ish</b> mumkin."
     )
@@ -1144,9 +1180,13 @@ async def cmd_start(message: Message, state: FSMContext):
                 try:
                     await bot.send_message(
                         int(referrer_id),
-                        "🎉 <b>Tabriklaymiz!</b> Siz 3 ta do'stingizni taklif qildingiz "
-                        "va sizga <b>3 kunlik PRO tarif</b> taqdim etildi!\n\n"
-                        "✅ Profil bio'ngizdan reklama olib tashlandi."
+                        (
+                            "🎉 Taklif uchun rahmat! Botning barcha funksiyalari bepul."
+                            if FREE_MODE else
+                            "🎉 <b>Tabriklaymiz!</b> Siz 3 ta do'stingizni taklif qildingiz "
+                            "va sizga <b>3 kunlik PRO tarif</b> taqdim etildi!\n\n"
+                            "✅ Profil bio'ngizdan reklama olib tashlandi."
+                        )
                     )
                 except Exception:
                     pass
@@ -1194,6 +1234,71 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
         get_start_message(callback.from_user.first_name or "", callback.from_user.id),
         reply_markup=await get_user_main_keyboard(callback.from_user.id)
     )
+
+
+@dp.callback_query(F.data == "profile")
+async def cb_profile(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT username, pro_until FROM users WHERE id = ?", (uid,)
+        ) as cur:
+            user = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_id = ?", (uid,)
+        ) as cur:
+            account_count = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM scraped_users WHERE owner_id = ?", (uid,)
+        ) as cur:
+            scraped_count = (await cur.fetchone())[0]
+    username = f"@{html.escape(user[0])}" if user and user[0] else "yo'q"
+    subscription = "Bepul" if FREE_MODE else (
+        "PRO" if is_pro_user(user[1] if user else None) else "Oddiy"
+    )
+    await callback.message.edit_text(
+        "👤 <b>Profil</b>\n\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"🔗 Username: {username}\n"
+        f"💳 Tarif: <b>{subscription}</b>\n"
+        f"📱 Ulangan akkauntlar: <b>{account_count}</b>\n"
+        f"👥 Bazadagi userlar: <b>{scraped_count}</b>",
+        reply_markup=back_kb("main_menu")
+    )
+
+
+@dp.callback_query(F.data == "help")
+async def cb_help(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📖 <b>Yordam</b>\n\n"
+        "1. Avval <b>Akauntlar</b> bo'limidan Telegram akkauntingizni ulang.\n"
+        "2. Kerakli funksiyani menyudan tanlang va ko'rsatmalarga amal qiling.\n"
+        "3. Akkauntni uzish uchun Akauntlar bo'limidagi chiqish tugmasidan foydalaning.\n\n"
+        "Kirish kodi va 2FA parolini faqat o'zingiz botga kiriting. Bot adminlari bilan ulashmang.",
+        reply_markup=back_kb("main_menu")
+    )
+
+
+@dp.callback_query(F.data == "rules")
+async def cb_rules(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📜 <b>Foydalanish qoidalari</b>\n\n"
+        "• Akkauntingiz seansini va tasdiqlash kodlarini himoya qiling.\n"
+        "• Guruh a'zolarining maxfiyligini hurmat qiling; roziliksiz reklama yoki ommaviy xabar yubormang.\n"
+        "• Guruh boshqaruv buyruqlaridan faqat vakolatingiz bor joyda foydalaning.\n"
+        "• Telegram cheklovlarini chetlab o'tishga urinmang.",
+        reply_markup=back_kb("main_menu")
+    )
+
+
+@dp.callback_query(F.data == "prices")
+async def cb_prices(callback: CallbackQuery):
+    text = (
+        "💰 <b>Tariflar</b>\n\n🆓 Barcha mavjud funksiyalar hozir bepul.\n"
+        "VIP yoki to'lov talab qilinmaydi."
+        if FREE_MODE else "💰 Tariflar haqida ma'lumot olish uchun yordamga murojaat qiling."
+    )
+    await callback.message.edit_text(text, reply_markup=back_kb("main_menu"))
 
 
 @dp.callback_query(F.data.in_({"raid_panel", "ban_panel"}))
@@ -1385,6 +1490,13 @@ async def cb_set_utag_speed(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "settings_buy_pro")
 async def cb_buy_pro(callback: CallbackQuery):
+    if FREE_MODE:
+        await callback.message.edit_text(
+            "🆓 <b>To'liq bepul rejim</b>\n\n"
+            "Bot funksiyalaridan foydalanish uchun VIP yoki to'lov talab qilinmaydi.",
+            reply_markup=back_kb("btn_settings")
+        )
+        return
     text = (
         "💳 <b>PRO Tarif Sotib Olish</b>\n\n"
         "✅ Reklamasiz uTag\n"
@@ -1403,6 +1515,8 @@ async def cb_buy_pro(callback: CallbackQuery):
 
 
 async def get_clone_price() -> int:
+    if FREE_MODE:
+        return 0
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
             "SELECT value FROM bot_settings WHERE key = 'clone_price_stars'"
@@ -1584,7 +1698,7 @@ async def cb_my_ref(callback: CallbackQuery):
     await callback.message.edit_text(
         f"📢 <b>Sizning referal havolangiz:</b>\n\n"
         f"<code>https://t.me/{username}?start={uid}</code>\n\n"
-        "3 ta do'stingizni taklif qiling — <b>3 kunlik PRO tarif</b> oling!",
+        f"{'Bot hozir to\'liq bepul. Taklif havolangiz orqali do\'stlaringizni chaqiring.' if FREE_MODE else '3 ta do\'stingizni taklif qiling — <b>3 kunlik PRO tarif</b> oling!'}",
         reply_markup=back_kb("btn_settings")
     )
 
@@ -1593,6 +1707,13 @@ async def cb_my_ref(callback: CallbackQuery):
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data == "btn_pro_info")
 async def cb_pro_info(callback: CallbackQuery):
+    if FREE_MODE:
+        await callback.message.edit_text(
+            "🆓 <b>To'liq bepul rejim</b>\n\n"
+            "Barcha mavjud bot funksiyalaridan foydalanish uchun VIP yoki to'lov kerak emas.",
+            reply_markup=back_kb("main_menu")
+        )
+        return
     uid = str(callback.from_user.id)
     username = _active_bot_username.get() or bot_username
     async with aiosqlite.connect(DB_FILE) as db:
@@ -2043,7 +2164,7 @@ async def finalize_login(user_id: int, client: TelegramClient, phone: str, state
     await bot.send_message(
         user_id,
         f"✅ <b>{name}</b> akkaunti muvaffaqiyatli ulandi!\n\n"
-        f"{'🟢 PRO tarif faol — reklama yo\'q' if pro else '🔴 Oddiy tarif — reklama bio ga qo\'yildi'}\n\n"
+        f"{'🆓 Bepul rejim faol — reklama yo\'q' if FREE_MODE else ('🟢 PRO tarif faol — reklama yo\'q' if pro else '🔴 Oddiy tarif — reklama bio ga qo\'yildi')}\n\n"
         f"{get_utag_command_help()}",
         reply_markup=await get_user_main_keyboard(user_id)
     )
@@ -2215,14 +2336,18 @@ async def do_utag(client: TelegramClient, uid: str, event, random_mode: bool = F
 async def register_userbot_handlers(client: TelegramClient, uid: str):
     """Userbot uchun guruh event handlerlarini ro'yxatdan o'tkazish."""
 
-    async def is_auto_reply_enabled() -> tuple[bool, str | None]:
+    async def get_auto_reply_config() -> tuple[bool, str | None, int]:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                "SELECT enabled, response_text FROM auto_reply_settings WHERE owner_id = ?",
+                "SELECT enabled, response_text, cooldown_seconds FROM auto_reply_settings WHERE owner_id = ?",
                 (uid,)
             ) as cur:
                 row = await cur.fetchone()
-        return bool(row and row[0]), row[1] if row else None
+        return (
+            bool(row and row[0]),
+            row[1] if row else None,
+            max(60, min(int(row[2]), 86400)) if row else 14400,
+        )
 
     @client.on(events.NewMessage(incoming=True))
     async def on_incoming_message(event):
@@ -2233,7 +2358,7 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
         if not sender or getattr(sender, "bot", False) or getattr(sender, "id", None) is None:
             return
 
-        enabled, response_text = await is_auto_reply_enabled()
+        enabled, response_text, cooldown_seconds = await get_auto_reply_config()
         if not enabled or not response_text:
             return
 
@@ -2244,7 +2369,7 @@ async def register_userbot_handlers(client: TelegramClient, uid: str):
             cooldown_key = (uid, int(sender.id))
             last_sent = _auto_reply_cooldowns.get(cooldown_key)
             now = datetime.now(timezone.utc)
-            if last_sent and (now - last_sent).total_seconds() < 900:
+            if last_sent and (now - last_sent).total_seconds() < cooldown_seconds:
                 return
 
             async with aiosqlite.connect(DB_FILE) as db:
@@ -2459,17 +2584,21 @@ async def auto_msg_send(message: Message, state: FSMContext):
 # ─────────────────────────────────────────────
 # AVTO JAVOB
 # ─────────────────────────────────────────────
-async def get_auto_reply_settings(uid: str) -> tuple[bool, str | None]:
+async def get_auto_reply_settings(uid: str) -> tuple[bool, str | None, int]:
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT enabled, response_text FROM auto_reply_settings WHERE owner_id = ?",
+            "SELECT enabled, response_text, cooldown_seconds FROM auto_reply_settings WHERE owner_id = ?",
             (uid,)
         ) as cur:
             row = await cur.fetchone()
-    return bool(row and row[0]), row[1] if row else None
+    return (
+        bool(row and row[0]),
+        row[1] if row else DEFAULT_AUTO_REPLY_TEXT,
+        max(60, min(int(row[2]), 86400)) if row else 14400,
+    )
 
 
-def get_auto_reply_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+def get_auto_reply_keyboard(enabled: bool, cooldown_seconds: int = 14400) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(
         text="✏️ Javob matnini o'zgartirish",
@@ -2480,6 +2609,15 @@ def get_auto_reply_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             text="⛔ Avto javobni o'chirish",
             callback_data="auto_reply_disable"
         ))
+    else:
+        kb.row(InlineKeyboardButton(
+            text="✅ Avto javobni yoqish",
+            callback_data="auto_reply_enable"
+        ))
+    kb.row(InlineKeyboardButton(
+        text=f"⏱ Takrorlash oralig'i: {cooldown_seconds // 3600} soat",
+        callback_data="auto_reply_cooldown"
+    ))
     kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="main_menu"))
     return kb.as_markup()
 
@@ -2491,19 +2629,65 @@ async def cb_auto_reply_menu(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❗ Avval akkaunt ulang!", show_alert=True)
         return
     await state.clear()
-    enabled, response_text = await get_auto_reply_settings(uid)
+    enabled, response_text, cooldown_seconds = await get_auto_reply_settings(uid)
     status = "🟢 Yoqilgan" if enabled else "🔴 O'chirilgan"
     saved_text = response_text or "Hali javob matni saqlanmagan."
     await callback.message.edit_text(
         "💠 <b>Avto Javob</b>\n\n"
         f"Holati: <b>{status}</b>\n"
         "Akkaunt <b>offline</b> bo'lganda shaxsiy xabarlarga avtomatik javob beradi.\n"
-        "Bir odamga 15 daqiqada ko'pi bilan bir marta javob yuboriladi.\n"
-        "Oddiy tarifda reklama siz kiritgan matnning tagiga qo'shiladi.\n"
-        "PRO tarifda reklama umuman chiqmaydi.\n\n"
+        f"Bir odamga har {cooldown_seconds // 3600} soatda ko'pi bilan bir marta javob yuboriladi.\n"
+        f"{'Bepul rejimda reklama qo\'shilmaydi.\n' if FREE_MODE else 'Oddiy tarifda reklama qo\'shiladi; PRO tarifda qo\'shilmaydi.\n'}"
         f"<b>Joriy javob:</b>\n{html.escape(saved_text)}",
-        reply_markup=get_auto_reply_keyboard(enabled)
+        reply_markup=get_auto_reply_keyboard(enabled, cooldown_seconds)
     )
+
+
+@dp.callback_query(F.data == "auto_reply_cooldown")
+async def cb_auto_reply_cooldown(callback: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    for hours in (1, 4, 8, 12, 24):
+        kb.row(InlineKeyboardButton(
+            text=f"{hours} soat",
+            callback_data=f"auto_reply_cooldown:{hours * 3600}"
+        ))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="btn_auto_reply"))
+    await callback.message.edit_text(
+        "⏱ Bir foydalanuvchiga javoblar orasidagi vaqtni tanlang:",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("auto_reply_cooldown:"))
+async def cb_set_auto_reply_cooldown(callback: CallbackQuery):
+    try:
+        cooldown_seconds = int(callback.data.split(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("Noto'g'ri vaqt.", show_alert=True)
+        return
+    if cooldown_seconds not in {3600, 14400, 28800, 43200, 86400}:
+        await callback.answer("Noto'g'ri vaqt.", show_alert=True)
+        return
+    uid = str(callback.from_user.id)
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO auto_reply_settings "
+            "(owner_id, enabled, response_text, cooldown_seconds, updated_at) "
+            "VALUES (?, 0, ?, ?, ?) ON CONFLICT(owner_id) DO UPDATE SET "
+            "cooldown_seconds = excluded.cooldown_seconds, updated_at = excluded.updated_at",
+            (uid, DEFAULT_AUTO_REPLY_TEXT, cooldown_seconds, now)
+        )
+        await db.commit()
+    enabled, response_text, saved_cooldown = await get_auto_reply_settings(uid)
+    await callback.message.edit_text(
+        "💠 <b>Avto Javob</b>\n\n"
+        f"Holati: <b>{'🟢 Yoqilgan' if enabled else '🔴 O\'chirilgan'}</b>\n"
+        f"Takrorlash oralig'i: <b>{saved_cooldown // 3600} soat</b>\n\n"
+        f"<b>Joriy javob:</b>\n{html.escape(response_text or 'Hali javob matni saqlanmagan.')}",
+        reply_markup=get_auto_reply_keyboard(enabled, saved_cooldown)
+    )
+    await callback.answer("Cooldown saqlandi.")
 
 
 @dp.callback_query(F.data == "auto_reply_set")
@@ -2512,8 +2696,7 @@ async def cb_auto_reply_set(callback: CallbackQuery, state: FSMContext):
         "✏️ Foydalanuvchi sizga yozganda, akkauntingiz offline bo'lsa "
         "yuboriladigan javob matnini kiriting.\n\n"
         "Siz yozgan matn javobning asosiy qismi bo'ladi.\n"
-        "Oddiy tarifda uning tagiga avtomatik reklama qo'shiladi.\n"
-        "PRO tarifda reklama qo'shilmaydi.",
+        f"{'Bepul rejimda reklama qo\'shilmaydi.' if FREE_MODE else 'Oddiy tarifda reklama qo\'shiladi, PRO tarifda qo\'shilmaydi.'}",
         reply_markup=back_kb("btn_auto_reply")
     )
     await state.set_state(UserStatesGroup.auto_reply_text)
@@ -2529,8 +2712,10 @@ async def auto_reply_text_input(message: Message, state: FSMContext):
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO auto_reply_settings "
-            "(owner_id, enabled, response_text, updated_at) VALUES (?, 1, ?, ?)",
+            "INSERT INTO auto_reply_settings "
+            "(owner_id, enabled, response_text, updated_at) VALUES (?, 1, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET enabled = 1, "
+            "response_text = excluded.response_text, updated_at = excluded.updated_at",
             (uid, response_text, now)
         )
         await db.commit()
@@ -2538,7 +2723,8 @@ async def auto_reply_text_input(message: Message, state: FSMContext):
     await message.answer(
         "✅ Avto javob yoqildi va bazaga saqlandi.\n"
         "Akkauntingiz offline bo'lganda foydalanuvchiga javob yuboriladi.\n"
-        "Oddiy tarifda reklama matn tagiga qo'shiladi, PRO tarifda esa reklama chiqmaydi.",
+        "Bepul rejimda javobga reklama qo'shilmaydi." if FREE_MODE else
+        "Oddiy tarifda reklama qo'shiladi, PRO tarifda reklama chiqmaydi.",
         reply_markup=await get_user_main_keyboard(message.from_user.id)
     )
 
@@ -2559,6 +2745,29 @@ async def cb_auto_reply_disable(callback: CallbackQuery):
         "Avto javobni qayta yoqish uchun javob matnini saqlang.",
         reply_markup=get_auto_reply_keyboard(False)
     )
+
+
+@dp.callback_query(F.data == "auto_reply_enable")
+async def cb_auto_reply_enable(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO auto_reply_settings "
+            "(owner_id, enabled, response_text, updated_at) VALUES (?, 1, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET enabled = 1, updated_at = excluded.updated_at",
+            (uid, DEFAULT_AUTO_REPLY_TEXT, now)
+        )
+        await db.commit()
+    enabled, response_text, cooldown_seconds = await get_auto_reply_settings(uid)
+    await callback.message.edit_text(
+        "💠 <b>Avto Javob</b>\n\n"
+        "Holati: <b>🟢 Yoqilgan</b>\n"
+        f"Takrorlash oralig'i: <b>{cooldown_seconds // 3600} soat</b>\n\n"
+        f"<b>Joriy javob:</b>\n{html.escape(response_text or DEFAULT_AUTO_REPLY_TEXT)}",
+        reply_markup=get_auto_reply_keyboard(enabled, cooldown_seconds)
+    )
+    await callback.answer("Avto javob yoqildi.")
 
 # ─────────────────────────────────────────────
 # USER YIG'ISH (SCRAPE)
